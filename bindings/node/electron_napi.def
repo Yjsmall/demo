@@ -1,0 +1,7 @@
+EXPORTS
+    napi_create_function
+    napi_create_object
+    napi_create_string_utf8
+    napi_create_uint32
+    napi_set_named_property
+    napi_throw_error

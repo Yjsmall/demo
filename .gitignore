@@ -1,0 +1,6 @@
+.pixi/
+build/
+out/
+node_modules/
+hosts/electron/node_modules/
+npm-debug.log*

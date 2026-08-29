@@ -1,0 +1,6 @@
+add_executable(reader_core_test unit/reader_core_test.cpp)
+target_link_libraries(reader_core_test PRIVATE context_reader::core)
+target_compile_features(reader_core_test PRIVATE cxx_std_20)
+context_reader_enable_warnings(reader_core_test)
+
+add_test(NAME reader_core_test COMMAND reader_core_test)

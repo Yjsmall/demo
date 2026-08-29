@@ -1,0 +1,22 @@
+{
+  "name": "context-reader",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Kernel-first contextual PDF reader",
+  "main": "hosts/electron/src/main.cjs",
+  "scripts": {
+    "native:build": "cmake-js rebuild --runtime electron --runtime-version 44.0.0 --arch x64 --generator Ninja --out build/node-ucrt64 --CDCMAKE_TOOLCHAIN_FILE=cmake/toolchains/msys2-ucrt64.cmake --CDCONTEXT_READER_BUILD_NODE=ON --CDCONTEXT_READER_BUILD_TESTS=OFF",
+    "smoke:electron": "node scripts/run-electron-smoke.cjs",
+    "test:p0": "npm run native:build && npm run smoke:electron"
+  },
+  "devDependencies": {
+    "cmake-js": "8.0.0",
+    "electron": "44.0.0"
+  },
+  "cmake-js": {
+    "runtime": "electron",
+    "runtimeVersion": "44.0.0",
+    "arch": "x64",
+    "generator": "Ninja"
+  }
+}

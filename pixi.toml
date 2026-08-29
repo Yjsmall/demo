@@ -1,0 +1,24 @@
+[workspace]
+name = "context-reader"
+version = "0.1.0"
+description = "Reproducible development tools for Context Reader"
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[dependencies]
+cmake = ">=3.28,<4"
+ninja = ">=1.12,<2"
+nodejs = ">=24,<25"
+
+[target.win-64.activation]
+scripts = ["scripts/activate-msys2.bat"]
+
+[tasks]
+configure = "cmake --preset dev-ucrt64"
+build = { cmd = "cmake --build --preset dev-ucrt64", depends-on = ["configure"] }
+test = { cmd = "ctest --preset dev-ucrt64", depends-on = ["build"] }
+node-install = "npm ci"
+node-build = { cmd = "npm run native:build", depends-on = ["node-install"] }
+node-import-check = { cmd = "pwsh -NoProfile -File scripts/check-node-imports.ps1", depends-on = ["node-build"] }
+electron-smoke = { cmd = "npm run smoke:electron", depends-on = ["node-import-check"] }
+p0 = { depends-on = ["test", "electron-smoke"] }
