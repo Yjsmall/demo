@@ -25,7 +25,10 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: mingw-w64-ucrt-x86_64-gcc
+          install: >-
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-lld
 
       - name: Export MSYS2 root
         shell: pwsh

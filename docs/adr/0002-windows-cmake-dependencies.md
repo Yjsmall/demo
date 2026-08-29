@@ -1,6 +1,6 @@
 # ADR-0002：Windows x64、Pixi 工具环境与 CMake 依赖管理
 
-状态：Accepted
+状态：Accepted（首选编译器由 ADR-0004 部分取代）
 
 日期：2026-08-29
 
@@ -37,6 +37,6 @@ Pixi 提供 Windows 环境、lockfile 和任务管理，适合锁定 CMake、Nin
 ## 后续验证
 
 - 后续 Electron major 升级必须重新运行 `.node` 构建、PE 导入边界和 Utility Process 加载测试。
-- P1 仍需验证商业 MuPDF 发行包的 Windows 构建命令和 CMake imported target 封装。
+- MuPDF 1.28.3 的 Windows 构建命令、提交锁定和 CMake imported target 已由 ADR-0003 的 2026-08-29 验证记录落实。
 
 P0 的具体版本、MinGW import library 处理和验证结果见 ADR-0003。

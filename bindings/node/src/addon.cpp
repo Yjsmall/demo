@@ -47,16 +47,24 @@ napi_value runtime_info_impl(napi_env environment) {
     napi_value result = nullptr;
     napi_value version_value = nullptr;
     napi_value api_version_value = nullptr;
+    napi_value binding_napi_version_value = nullptr;
 
     if(napi_create_object(environment, &result) != napi_ok
        || napi_create_string_utf8(environment, version, NAPI_AUTO_LENGTH, &version_value) != napi_ok
        || napi_create_uint32(environment, info.application_api_version, &api_version_value) != napi_ok
+       || napi_create_uint32(environment, NAPI_VERSION, &binding_napi_version_value) != napi_ok
        || !set_named_property(environment, result, "version", version_value)
        || !set_named_property(
            environment,
            result,
            "applicationApiVersion",
            api_version_value
+       )
+       || !set_named_property(
+           environment,
+           result,
+           "bindingNapiVersion",
+           binding_napi_version_value
        )) {
         napi_throw_error(environment, "NAPI_RESULT_FAILED", "Failed to create runtime info result");
         return nullptr;

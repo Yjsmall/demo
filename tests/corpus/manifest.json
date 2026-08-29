@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "fixture_id": "generated-basic-rotated-cropbox-v1",
+      "path": "generated/basic-rotated-cropbox.pdf",
+      "document_sha256": "f405ce309444499b939005d0cd1189891e19bc61bfa4440155ce5b4e8a065b8d",
+      "origin": "scripts/generate-pdf-fixtures.cjs",
+      "license": "LicenseRef-ContextReader-Generated-Fixture",
+      "redistributable": true,
+      "features": ["normal", "rotated-page", "crop-box"],
+      "expected_outcome": "opens",
+      "related_issue": null,
+      "added_by_change": "P1 PDF risk validation"
+    },
+    {
+      "fixture_id": "generated-cjk-to-unicode-v1",
+      "path": "generated/cjk-to-unicode.pdf",
+      "document_sha256": "f4a27c0d335a4c225bd15f18988d5108316ef308625be8e39aff23f2930f8c0c",
+      "origin": "scripts/generate-pdf-fixtures.cjs",
+      "license": "LicenseRef-ContextReader-Generated-Fixture",
+      "redistributable": true,
+      "features": ["cjk", "to-unicode", "type3-font"],
+      "expected_outcome": "opens-with-text",
+      "related_issue": null,
+      "added_by_change": "P1 PDF risk validation"
+    },
+    {
+      "fixture_id": "generated-double-column-v1",
+      "path": "generated/double-column.pdf",
+      "document_sha256": "495c170dd22532032df3555759f706404f60ecda22dc8264dd321eba9272cfe6",
+      "origin": "scripts/generate-pdf-fixtures.cjs",
+      "license": "LicenseRef-ContextReader-Generated-Fixture",
+      "redistributable": true,
+      "features": ["double-column", "reading-order"],
+      "expected_outcome": "opens-with-text",
+      "related_issue": null,
+      "added_by_change": "P1 PDF risk validation"
+    },
+    {
+      "fixture_id": "generated-image-only-scan-v1",
+      "path": "generated/image-only-scan.pdf",
+      "document_sha256": "80fa41d3e3e8de6f3ede4b9dfba21c0c90a142ef3880db61d45144880399f5f5",
+      "origin": "scripts/generate-pdf-fixtures.cjs",
+      "license": "LicenseRef-ContextReader-Generated-Fixture",
+      "redistributable": true,
+      "features": ["scanned", "image-only"],
+      "expected_outcome": "opens-without-text",
+      "related_issue": null,
+      "added_by_change": "P1 PDF risk validation"
+    },
+    {
+      "fixture_id": "generated-corrupt-truncated-v1",
+      "path": "generated/corrupt-truncated.pdf",
+      "document_sha256": "772ad3ea1f583ad7d8b54af6ef33f6280f2a23752cbd329f43c6e84fd1296e17",
+      "origin": "scripts/generate-pdf-fixtures.cjs",
+      "license": "LicenseRef-ContextReader-Generated-Fixture",
+      "redistributable": true,
+      "features": ["corrupt"],
+      "expected_outcome": "pdf_failure",
+      "related_issue": null,
+      "added_by_change": "P1 PDF risk validation"
+    }
+  ]
+}

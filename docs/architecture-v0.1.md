@@ -570,7 +570,7 @@ replay format version
 
 实施以能够运行和验收的纵向阶段组织，不按模块或工具数量衡量进度：
 
-1. P0 决策与工程骨架：验证独立 MSYS2 UCRT64 GCC 工具链，确认 MuPDF 许可和 Electron/Node 版本策略，建立由 Pixi 驱动的 Windows x64 最小 CMake/CI。
+1. P0 决策与工程骨架：验证独立 MSYS2 UCRT64 工具链，确认 MuPDF 许可和 Electron/Node 版本策略，建立由 Pixi 驱动的 Windows x64 最小 CMake/CI。
 2. P1 PDF 风险验证：实现 PdfEngine Port、MuPDF Adapter、最小 Probe 和首批 Fixture，验证渲染、文本布局和坐标往返。
 3. P2 Electron 首个纵向闭环：实现最小 Workspace、Document、Annotation、Note、`reader_node` 和 Electron Host，完成导入、阅读、选择、高亮、笔记与重启恢复。
 4. P3 数据与边界稳定：补齐锁恢复、迁移、备份不变量、Node-API 契约测试和真实异步场景的 Replay。
@@ -587,7 +587,7 @@ replay format version
 - 首发平台为 Windows x64。
 - Scoop 只负责引导安装 Pixi 和独立 MSYS2；Pixi 负责锁定 CMake、Ninja 等开发工具和项目任务环境。
 - 构建系统使用 CMake 3.28+；第三方依赖由 CMake `FetchContent`、`add_subdirectory` 或受控 `ExternalProject` 获取和编排，不引入 vcpkg 或 Conan。
-- 首选编译器候选为独立 MSYS2 UCRT64 GCC 16.2.0；其 Electron Node-API 兼容性由 P0 原生模块加载测试决定。
+- 首选编译器为独立 MSYS2 UCRT64 Clang 22.1.8，GCC 16.2.0 作为回退；两者的 Electron Node-API 兼容性由 P0 原生模块加载测试决定。
 - `reader_node` 直接调用 C++ Application Facade，不经过 C ABI。
 - Kernel 和一方 C++ Binding 统一使用 C++20 编译；已有 C++17 风格代码作为 C++20 的兼容子集纳入。
 - 首版 Markdown 使用源码编辑加预览，不引入富文本双向转换。
@@ -595,7 +595,7 @@ replay format version
 
 尚未确定的事项按最晚决策阶段处理：
 
-- P0 结束前：使用独立 MSYS2 UCRT64 GCC 16.2.0 通过目标 Electron 的 `.node` 模块加载测试，或根据测试结果改用 MSVC/clang-cl；同时确认 Node/Electron 版本策略、MuPDF 开源或商业许可方案，并验证 MuPDF 在 Windows 上的 CMake 编排方式。
+- P0 已使用独立 MSYS2 UCRT64 GCC 16.2.0 通过目标 Electron 的 `.node` 模块加载测试；ADR-0004 要求 Clang 首选路径维持同一验证。同时确认 Node/Electron 版本策略、MuPDF 开源或商业许可方案，并验证 MuPDF 在 Windows 上的 CMake 编排方式。
 - P1 基线入库前：公共 PDF Fixture 的来源、授权审核和二进制存储方式。
 - P2 持久化实现前：Workspace 锁恢复、对象文件与 SQLite 提交/清理协议、备份一致性语义。
 - P3 Replay 实现前：Run Manifest 和 Replay 首版采用 JSON Schema 还是代码生成 IDL。

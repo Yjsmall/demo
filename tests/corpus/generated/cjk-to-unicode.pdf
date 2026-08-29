@@ -1,0 +1,86 @@
+%PDF-1.7
+% Context Reader generated fixture: cjk-to-unicode
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /g1 6 0 R /g2 7 0 R /g3 8 0 R /g4 9 0 R >> /Encoding << /Type /Encoding /Differences [1 /g1 /g2 /g3 /g4] >> /FirstChar 1 /LastChar 4 /Widths [1000 1000 1000 1000] /ToUnicode 10 0 R /Resources << >> >>
+endobj
+5 0 obj
+<<  /Length 40 >>
+stream
+BT /F1 36 Tf 50 150 Td <01020304> Tj ET
+endstream
+endobj
+6 0 obj
+<<  /Length 49 >>
+stream
+1000 0 0 0 1000 1000 d1 0 g 100 100 800 800 re f
+endstream
+endobj
+7 0 obj
+<<  /Length 70 >>
+stream
+1000 0 0 0 1000 1000 d1 0 g 100 100 300 800 re f 600 100 300 800 re f
+endstream
+endobj
+8 0 obj
+<<  /Length 70 >>
+stream
+1000 0 0 0 1000 1000 d1 0 g 100 100 800 300 re f 100 600 800 300 re f
+endstream
+endobj
+9 0 obj
+<<  /Length 72 >>
+stream
+1000 0 0 0 1000 1000 d1 0 g 100 100 m 900 900 l 700 900 l 100 300 l h f
+endstream
+endobj
+10 0 obj
+<<  /Length 386 >>
+stream
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (ContextReader) /Ordering (Generated) /Supplement 0 >> def
+/CMapName /ContextReaderGenerated def
+/CMapType 2 def
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+4 beginbfchar
+<01> <8BED>
+<02> <5883>
+<03> <9605>
+<04> <8BFB>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+endstream
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000060 00000 n 
+0000000109 00000 n 
+0000000166 00000 n 
+0000000292 00000 n 
+0000000613 00000 n 
+0000000703 00000 n 
+0000000802 00000 n 
+0000000922 00000 n 
+0000001042 00000 n 
+0000001164 00000 n 
+trailer
+<< /Size 11 /Root 1 0 R >>
+startxref
+1602
+%%EOF

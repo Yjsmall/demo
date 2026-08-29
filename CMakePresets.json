@@ -17,18 +17,40 @@
         "CONTEXT_READER_BUILD_NODE": "OFF",
         "CONTEXT_READER_BUILD_TESTS": "ON"
       }
+    },
+    {
+      "name": "p1-ucrt64",
+      "displayName": "P1 - MuPDF 1.28.3",
+      "inherits": "dev-ucrt64",
+      "binaryDir": "${sourceDir}/build/p1-ucrt64",
+      "cacheVariables": {
+        "CONTEXT_READER_BUILD_TOOLS": "ON",
+        "CONTEXT_READER_ENABLE_MUPDF": "ON",
+        "CONTEXT_READER_MUPDF_ROOT": "${sourceDir}/build/mupdf-1.28.3"
+      }
     }
   ],
   "buildPresets": [
     {
       "name": "dev-ucrt64",
       "configurePreset": "dev-ucrt64"
+    },
+    {
+      "name": "p1-ucrt64",
+      "configurePreset": "p1-ucrt64"
     }
   ],
   "testPresets": [
     {
       "name": "dev-ucrt64",
       "configurePreset": "dev-ucrt64",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "p1-ucrt64",
+      "configurePreset": "p1-ucrt64",
       "output": {
         "outputOnFailure": true
       }

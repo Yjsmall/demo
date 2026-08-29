@@ -27,7 +27,7 @@ C++ Application Facade
 
 所有 C++ 目标统一以 C++20 编译。已有只使用 C++17 特性的代码可以直接纳入，但不为不同业务模块配置不同的语言标准。
 
-Pixi 锁定 CMake、Ninja 等开发工具版本并提供统一任务入口。构建系统使用 CMake 3.28+；源码依赖获取和构建由 CMake 统一编排：优先使用 `FetchContent` 和 `add_subdirectory`，不提供原生 CMake 构建的依赖使用受控 `ExternalProject`。不引入 vcpkg 或 Conan，所有依赖必须锁定版本、来源和完整性哈希。Pixi/conda 包不作为 MSYS2 UCRT64 GCC 的链接时 C++ 库。
+Pixi 锁定 CMake、Ninja 等开发工具版本并提供统一任务入口。构建系统使用 CMake 3.28+；源码依赖获取和构建由 CMake 统一编排：优先使用 `FetchContent` 和 `add_subdirectory`，不提供原生 CMake 构建的依赖使用受控 `ExternalProject`。不引入 vcpkg 或 Conan，所有依赖必须锁定版本、来源和完整性哈希。Pixi/conda 包不作为 MSYS2 UCRT64 工具链的链接时 C++ 库。
 
 ## 2. 产品 v0.1 范围
 
@@ -70,7 +70,7 @@ P0 决策与骨架
 
 交付内容：
 
-- 以 Windows x64 为首发目标，优先验证 Scoop 独立安装的 MSYS2 UCRT64 GCC 16.2.0；若 Electron 原生模块兼容测试失败，再评估 MSVC 或 clang-cl，并同步确认 Node/Electron 版本策略。
+- 以 Windows x64 为首发目标；MSYS2 UCRT64 GCC 16.2.0 已完成初始验证，ADR-0004 将 UCRT64 Clang 22.1.8 调整为首选并保留 GCC 回退。
 - MuPDF 商业许可已经取得；PDF Fixture 仍按来源、许可和可再分发状态逐项登记。
 - 建立 `pixi.toml`/`pixi.lock`，锁定 CMake、Ninja 等开发工具；建立 CMake 依赖清单，通过 `FetchContent`、`add_subdirectory` 或受控 `ExternalProject` 锁定源码依赖版本、来源和完整性哈希。
 - 建立 CMake target 骨架、`Result/Error`、稳定 ID、Composition Root 和最小测试入口。
@@ -80,10 +80,12 @@ P0 决策与骨架
 
 - 编译器、Node/Electron 版本和 MuPDF 许可已经记录为 ADR 或决策记录，不存在阻止 P1 集成 MuPDF 的许可和工具链问题。
 - 空 Kernel、一个单元测试和一个 Electron 原生模块加载测试能够在首发环境构建运行。
-- 若采用 MSYS2 UCRT64 GCC，系统 CMake 必须能通过 preset 显式选择该编译器，且生成的 `.node` 模块能被目标 Electron 版本加载；不能仅以命令行编译成功作为工具链验收。
+- 系统 CMake 必须能通过 preset 确定性选择 UCRT64 Clang 或 GCC，且生成的 `.node` 模块能被目标 Electron 版本加载；不能仅以命令行编译成功作为工具链验收。
 - CMake target 依赖方向可以被 CI 检查。
 
 ## 5. P1：PDF 风险验证
+
+本地实施状态：2026-08-29 已完成；`pixi run p1` 验证通过。MuPDF 1.28.3 按官方 tag 提交锁定，Clang 最小静态构建、CMake imported target、`PdfEngine` Adapter 和串行 `DocumentSession` 已通过真实集成测试。`reader-probe inspect/render/text/roundtrip/compare` 输出版本化页面信息、PNG、文本布局、坐标 JSONL、run manifest 和结构化基线差异。Fixture manifest 覆盖正常、CJK、双栏、旋转、CropBox、损坏和扫描场景，并校验授权元数据、路径和 SHA-256。
 
 交付内容：
 

@@ -6,6 +6,9 @@ const projectRoot = path.resolve(__dirname, '..', '..', '..');
 const addonPath = path.join(projectRoot, 'build', 'node-ucrt64', 'reader_node.node');
 const utilityPath = path.join(__dirname, 'utility.cjs');
 const timeoutMs = 15_000;
+const expectedElectronVersion = '44.0.0';
+const expectedNodeVersion = '24.18.1';
+const expectedBindingNapiVersion = 8;
 
 let child = null;
 let completed = false;
@@ -48,12 +51,15 @@ app.whenReady().then(() => {
     if (
       message?.status === 'ok'
       && message.processType === 'utility'
+      && message.processVersions?.electron === expectedElectronVersion
+      && message.processVersions?.node === expectedNodeVersion
       && message.runtimeInfo?.version === '0.1.0'
       && message.runtimeInfo?.applicationApiVersion === 1
+      && message.runtimeInfo?.bindingNapiVersion === expectedBindingNapiVersion
     ) {
       finish(
         0,
-        `Electron utility process loaded reader_node ${message.runtimeInfo.version}`,
+        `Electron ${message.processVersions.electron} / Node ${message.processVersions.node} utility process loaded reader_node ${message.runtimeInfo.version} with N-API ${message.runtimeInfo.bindingNapiVersion}`,
       );
       return;
     }

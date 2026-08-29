@@ -14,11 +14,19 @@ nodejs = ">=24,<25"
 scripts = ["scripts/activate-msys2.bat"]
 
 [tasks]
-configure = "cmake --preset dev-ucrt64"
+toolchain-check = "pwsh -NoProfile -File scripts/check-p0-toolchain.ps1"
+configure = "cmake --fresh --preset dev-ucrt64"
 build = { cmd = "cmake --build --preset dev-ucrt64", depends-on = ["configure"] }
 test = { cmd = "ctest --preset dev-ucrt64", depends-on = ["build"] }
 node-install = "npm ci"
 node-build = { cmd = "npm run native:build", depends-on = ["node-install"] }
 node-import-check = { cmd = "pwsh -NoProfile -File scripts/check-node-imports.ps1", depends-on = ["node-build"] }
 electron-smoke = { cmd = "npm run smoke:electron", depends-on = ["node-import-check"] }
-p0 = { depends-on = ["test", "electron-smoke"] }
+p0 = { depends-on = ["toolchain-check", "test", "electron-smoke"] }
+mupdf-prepare = "pwsh -NoProfile -File scripts/prepare-mupdf.ps1"
+fixture-verify = "node scripts/verify-pdf-fixtures.cjs"
+p1-configure = { cmd = "cmake --fresh --preset p1-ucrt64", depends-on = ["mupdf-prepare"] }
+p1-build = { cmd = "cmake --build --preset p1-ucrt64", depends-on = ["p1-configure"] }
+p1-test = { cmd = "ctest --preset p1-ucrt64", depends-on = ["p1-build"] }
+probe = { cmd = "build\\p1-ucrt64\\tools\\reader-probe.exe", depends-on = ["p1-build"] }
+p1 = { depends-on = ["toolchain-check", "fixture-verify", "p1-test"] }

@@ -43,7 +43,7 @@ Composition Root 组装运行环境
 - Scoop 只负责在开发机上引导安装 Pixi 和独立 MSYS2，不定义项目构建结果。
 - Pixi 通过 `pixi.toml` 和 `pixi.lock` 锁定 CMake、Ninja 等开发工具，并作为本地与 CI 的统一任务入口。
 - CMake 是唯一构建入口，并负责源码依赖获取和构建编排；项目不同时维护 vcpkg 或 Conan 清单。
-- MSYS2 `pacman` 只提供 UCRT64 编译器和必要的工具链组件。Pixi/conda 包不能直接作为 UCRT64 GCC 的链接时 C++ 库，避免混用不兼容 ABI。
+- MSYS2 `pacman` 只提供 UCRT64 编译器和必要的工具链组件。Clang 是首选，GCC 是回退；Pixi/conda 包不能直接作为 UCRT64 工具链的链接时 C++ 库，避免混用不兼容 ABI。
 - 原生支持 CMake 的源码依赖优先通过 `FetchContent` 获取并使用 `add_subdirectory` 集成。
 - 不提供原生 CMake 构建的依赖可以通过 `ExternalProject` 编排，但必须封装为项目拥有的 imported target，不能向业务 target 泄漏路径和平台参数。
 - 每项依赖必须锁定明确版本、不可变来源和 SHA-256 或等价完整性信息；禁止默认跟踪分支或浮动标签。

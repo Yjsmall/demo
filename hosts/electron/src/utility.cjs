@@ -12,6 +12,10 @@ try {
   send({
     status: 'ok',
     processType: process.type,
+    processVersions: {
+      electron: process.versions.electron,
+      node: process.versions.node,
+    },
     runtimeInfo,
   });
 } catch (error) {
