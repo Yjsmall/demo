@@ -2,7 +2,9 @@
 
 #include <filesystem>
 #include <memory>
+#include <vector>
 
+#include "context_reader/annotation/annotation.hpp"
 #include "context_reader/pdf/pdf_engine.hpp"
 #include "context_reader/shared/result.hpp"
 #include "context_reader/workspace/workspace.hpp"
@@ -37,6 +39,15 @@ public:
     );
     [[nodiscard]] Result<std::vector<DocumentRecord>> list_documents();
     [[nodiscard]] Result<ResolvedDocumentObject> resolve_document(DocumentId document_id);
+    [[nodiscard]] Result<AnnotationRecord> create_annotation(const CreateAnnotation& command);
+    [[nodiscard]] Result<std::vector<AnnotationRecord>> list_annotations(
+        DocumentVersionId document_version_id
+    );
+    [[nodiscard]] Result<void> delete_annotation(AnnotationId annotation_id);
+    [[nodiscard]] Result<NoteRecord> update_note(const UpdateNote& command);
+    [[nodiscard]] Result<std::vector<NoteRecord>> list_notes(
+        DocumentVersionId document_version_id
+    );
     [[nodiscard]] Result<WorkspaceVerification> verify();
 
 private:

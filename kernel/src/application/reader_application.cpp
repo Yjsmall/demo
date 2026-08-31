@@ -31,7 +31,7 @@ ReaderApplication::~ReaderApplication() = default;
 RuntimeInfo ReaderApplication::runtime_info() const noexcept {
     return RuntimeInfo{
         .version = RuntimeVersion{.major = 0, .minor = 1, .patch = 0},
-        .application_api_version = 3,
+        .application_api_version = 4,
     };
 }
 
@@ -230,6 +230,89 @@ Result<PageText> ReaderApplication::extract_page_text(std::size_t page_index) {
 #else
     static_cast<void>(page_index);
     return Result<PageText>::failure(
+        Error(ErrorCode::unsupported_document, "Workspace support is not available")
+    );
+#endif
+}
+
+Result<AnnotationRecord> ReaderApplication::create_annotation(const CreateAnnotation& command) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->workspace == nullptr) {
+        return Result<AnnotationRecord>::failure(Error(ErrorCode::not_found, "No workspace is open"));
+    }
+    return implementation_->workspace->create_annotation(command);
+#else
+    static_cast<void>(command);
+    return Result<AnnotationRecord>::failure(
+        Error(ErrorCode::unsupported_document, "Workspace support is not available")
+    );
+#endif
+}
+
+Result<std::vector<AnnotationRecord>> ReaderApplication::list_annotations(
+    DocumentVersionId document_version_id
+) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->workspace == nullptr) {
+        return Result<std::vector<AnnotationRecord>>::failure(
+            Error(ErrorCode::not_found, "No workspace is open")
+        );
+    }
+    return implementation_->workspace->list_annotations(document_version_id);
+#else
+    static_cast<void>(document_version_id);
+    return Result<std::vector<AnnotationRecord>>::failure(
+        Error(ErrorCode::unsupported_document, "Workspace support is not available")
+    );
+#endif
+}
+
+Result<void> ReaderApplication::delete_annotation(AnnotationId annotation_id) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->workspace == nullptr) {
+        return Result<void>::failure(Error(ErrorCode::not_found, "No workspace is open"));
+    }
+    return implementation_->workspace->delete_annotation(annotation_id);
+#else
+    static_cast<void>(annotation_id);
+    return Result<void>::failure(
+        Error(ErrorCode::unsupported_document, "Workspace support is not available")
+    );
+#endif
+}
+
+Result<NoteRecord> ReaderApplication::update_note(const UpdateNote& command) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->workspace == nullptr) {
+        return Result<NoteRecord>::failure(Error(ErrorCode::not_found, "No workspace is open"));
+    }
+    return implementation_->workspace->update_note(command);
+#else
+    static_cast<void>(command);
+    return Result<NoteRecord>::failure(
+        Error(ErrorCode::unsupported_document, "Workspace support is not available")
+    );
+#endif
+}
+
+Result<std::vector<NoteRecord>> ReaderApplication::list_notes(
+    DocumentVersionId document_version_id
+) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->workspace == nullptr) {
+        return Result<std::vector<NoteRecord>>::failure(
+            Error(ErrorCode::not_found, "No workspace is open")
+        );
+    }
+    return implementation_->workspace->list_notes(document_version_id);
+#else
+    static_cast<void>(document_version_id);
+    return Result<std::vector<NoteRecord>>::failure(
         Error(ErrorCode::unsupported_document, "Workspace support is not available")
     );
 #endif

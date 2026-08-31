@@ -103,6 +103,8 @@ P0 决策与骨架
 
 ## 6. P2：Electron 首个纵向闭环
 
+本地实施状态：进行中。已完成 Workspace schema v2、Quote Anchor 高亮、revision 化纯文本 Markdown Note，以及 Facade -> Node-API -> Electron Utility Process 的重启恢复验证；Renderer 阅读 UI、可取消 Job 与 Utility Process 事务边界故障注入仍待完成。
+
 交付内容：
 
 - 最小 Workspace、SQLite migration 和内容寻址对象仓库。

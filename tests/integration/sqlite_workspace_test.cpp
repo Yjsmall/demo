@@ -49,7 +49,7 @@ int main() {
     auto workspace = std::move(create_result).value();
     const auto initial_info = workspace->info();
     check(!initial_info.id.is_nil(), "workspace ID is non-nil");
-    check(initial_info.schema_version == 1U, "workspace schema version is one");
+    check(initial_info.schema_version == 2U, "workspace schema version is two");
     check(
         std::filesystem::is_regular_file(workspace_root / "workspace.db"),
         "workspace database exists"
@@ -115,6 +115,57 @@ int main() {
         );
     }
 
+    const CreateAnnotation annotation_command{
+        .document_version_id = imported.document.version_id,
+        .page_index = 0U,
+        .quads = {{.x = 72.0, .y = 96.0, .width = 180.0, .height = 18.0}},
+        .quote = {
+            .exact = "Context Reader P1",
+            .prefix = "",
+            .suffix = " fixture",
+        },
+        .layout_version = "mupdf-1.28.3",
+        .color = HighlightColor::yellow,
+    };
+    const auto annotation = workspace->create_annotation(annotation_command);
+    check(annotation.has_value(), "annotation is created from a page-coordinate anchor");
+    if(annotation) {
+        check(!annotation.value().id.is_nil(), "annotation ID is stable and non-nil");
+        check(annotation.value().quads == annotation_command.quads, "annotation quads round-trip");
+
+        const auto note = workspace->update_note(UpdateNote{
+            .annotation_id = annotation.value().id,
+            .expected_revision = 0U,
+            .markdown_source = "First **context** note",
+        });
+        check(note.has_value() && note.value().revision == 1U, "note is created at revision one");
+        const auto conflict = workspace->update_note(UpdateNote{
+            .annotation_id = annotation.value().id,
+            .expected_revision = 0U,
+            .markdown_source = "stale write",
+        });
+        check(!conflict.has_value(), "stale note revision is rejected");
+        if(!conflict) {
+            check(conflict.error().code() == ErrorCode::conflict, "note conflict error is stable");
+        }
+        const auto updated = workspace->update_note(UpdateNote{
+            .annotation_id = annotation.value().id,
+            .expected_revision = 1U,
+            .markdown_source = "Updated **context** note",
+        });
+        check(updated.has_value() && updated.value().revision == 2U, "matching note revision updates");
+    }
+
+    const auto invalid_annotation = workspace->create_annotation(CreateAnnotation{
+        .document_version_id = imported.document.version_id,
+        .page_index = 1U,
+        .quads = {{.x = 0.0, .y = 0.0, .width = 1.0, .height = 1.0}},
+        .quote = {.exact = "missing", .prefix = "", .suffix = ""},
+        .layout_version = "mupdf-1.28.3",
+        .color = HighlightColor::pink,
+    });
+    check(!invalid_annotation.has_value(), "annotation outside the document is rejected");
+
     workspace.reset();
     auto reopen_result = SqliteWorkspace::open(workspace_root, pdf_engine);
     check(reopen_result.has_value(), "workspace reopens after close");
@@ -134,6 +185,18 @@ int main() {
             );
         }
     }
+    const auto reopened_annotations = workspace->list_annotations(imported.document.version_id);
+    check(
+        reopened_annotations.has_value() && reopened_annotations.value().size() == 1U,
+        "annotation survives restart"
+    );
+    const auto reopened_notes = workspace->list_notes(imported.document.version_id);
+    check(
+        reopened_notes.has_value() && reopened_notes.value().size() == 1U
+            && reopened_notes.value().front().revision == 2U
+            && reopened_notes.value().front().markdown_source == "Updated **context** note",
+        "latest note revision survives restart"
+    );
 
     const auto displaced_object = object_path.string() + ".missing";
     std::filesystem::rename(object_path, displaced_object, filesystem_error);
@@ -209,6 +272,23 @@ int main() {
             );
             const auto missing_page = application.page_info(1U);
             check(!missing_page.has_value(), "facade rejects an out-of-range page");
+            const auto facade_annotation = application.create_annotation(CreateAnnotation{
+                .document_version_id = facade_import.value().document.version_id,
+                .page_index = 0U,
+                .quads = {{.x = 72.0, .y = 96.0, .width = 180.0, .height = 18.0}},
+                .quote = {.exact = "Context Reader P1", .prefix = "", .suffix = " fixture"},
+                .layout_version = "mupdf-1.28.3",
+                .color = HighlightColor::green,
+            });
+            check(facade_annotation.has_value(), "facade creates an annotation");
+            if(facade_annotation) {
+                const auto facade_note = application.update_note(UpdateNote{
+                    .annotation_id = facade_annotation.value().id,
+                    .expected_revision = 0U,
+                    .markdown_source = "Facade note",
+                });
+                check(facade_note.has_value(), "facade creates a linked note");
+            }
         }
         const auto facade_documents = application.list_documents();
         check(
@@ -234,6 +314,24 @@ int main() {
             "facade documents survive restart"
         );
         if(reopened_facade_documents && !reopened_facade_documents.value().empty()) {
+            const auto annotations = application.list_annotations(
+                reopened_facade_documents.value().front().version_id
+            );
+            const auto notes = application.list_notes(
+                reopened_facade_documents.value().front().version_id
+            );
+            check(annotations.has_value() && annotations.value().size() == 1U, "facade annotation persists");
+            check(notes.has_value() && notes.value().size() == 1U, "facade note persists");
+            if(annotations && !annotations.value().empty()) {
+                check(
+                    application.delete_annotation(annotations.value().front().id).has_value(),
+                    "facade deletes an annotation"
+                );
+                const auto deleted_notes = application.list_notes(
+                    reopened_facade_documents.value().front().version_id
+                );
+                check(deleted_notes.has_value() && deleted_notes.value().empty(), "annotation deletion removes its note");
+            }
             check(
                 application.open_document(
                     reopened_facade_documents.value().front().document_id

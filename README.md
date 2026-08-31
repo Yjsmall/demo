@@ -6,7 +6,7 @@ Context Reader 是一个以 PDF 语境阅读、文本高亮和 Markdown 笔记�
 
 ## 当前状态
 
-当前仓库已完成 P0 工具链与 P1 PDF 风险验证，正在实现 P2 Electron 纵向闭环。现有 P2 切片包含 SQLite Workspace、内容寻址 PDF 导入、重启恢复、只读不变量检查，以及 Electron Utility Process 到 Application Facade 的异步文档打开、页面渲染和文本提取路径；阅读 UI、批注和笔记尚未完成。
+当前仓库已完成 P0 工具链与 P1 PDF 风险验证，正在实现 P2 Electron 纵向闭环。现有 P2 切片包含 SQLite Workspace、内容寻址 PDF 导入、重启恢复、只读不变量检查，以及 Electron Utility Process 到 Application Facade 的异步文档打开、页面渲染、文本提取、Quote Anchor 高亮和 revision 化 Markdown 笔记路径；Renderer 阅读 UI、可取消 Job 和进程终止故障注入尚未完成。
 
 ## 核心决策
 
@@ -34,6 +34,7 @@ Context Reader 是一个以 PDF 语境阅读、文本高亮和 Markdown 笔记�
 - [ADR-0003：P0 工具链验收与 MuPDF 商业许可](docs/adr/0003-p0-toolchain-validation.md)
 - [ADR-0004：Clang 优先的 UCRT64 工具链](docs/adr/0004-clang-first-ucrt64-toolchain.md)
 - [ADR-0005：SQLite Workspace v1 与内容寻址对象仓库](docs/adr/0005-sqlite-workspace-v1.md)
+- [ADR-0006：Annotation、Quote Anchor 与 Note Workspace v2](docs/adr/0006-annotation-note-workspace-v2.md)
 
 ## 开发与验证
 
@@ -50,7 +51,7 @@ pixi run p2
 
 `pixi run p1` 会从官方 tag 准备锁定提交的 MuPDF 1.28.3 最小静态构建，验证 Fixture manifest，并运行 PDF Port、坐标、真实 MuPDF Adapter 和 `reader-probe inspect` 契约测试。独立 MSYS2 还需要安装 `make` 和 UCRT64 `pkgconf`；MuPDF 源码及构建产物只保存在忽略的 `build/` 目录。
 
-`pixi run p2` 在 P1 基础上构建 SQLite Workspace 与 P2 `reader_node`，运行持久化/重启集成测试、PE 导入边界检查，并由 Electron Utility Process 实际完成创建、导入、重复导入复用、关闭、重开、页面渲染、文本提取和完整性核验。
+`pixi run p2` 在 P1 基础上构建 SQLite Workspace 与 P2 `reader_node`，运行持久化/重启集成测试、PE 导入边界检查，并由 Electron Utility Process 实际完成创建、导入、重复导入复用、关闭、重开、页面渲染、文本提取、高亮、revision 冲突检测、笔记恢复和完整性核验。
 
 ```powershell
 pixi run probe inspect tests\corpus\generated\basic-rotated-cropbox.pdf --output build\probe-output

@@ -32,6 +32,11 @@ enum class Operation {
     page_info,
     render_page,
     extract_page_text,
+    create_annotation,
+    list_annotations,
+    delete_annotation,
+    update_note,
+    list_notes,
     verify_workspace,
 };
 
@@ -60,11 +65,16 @@ struct AddonContext final {
               {this, Operation::page_info},
               {this, Operation::render_page},
               {this, Operation::extract_page_text},
+              {this, Operation::create_annotation},
+              {this, Operation::list_annotations},
+              {this, Operation::delete_annotation},
+              {this, Operation::update_note},
+              {this, Operation::list_notes},
               {this, Operation::verify_workspace},
           }} {}
 
     std::shared_ptr<RuntimeState> state;
-    std::array<FunctionData, 11> functions;
+    std::array<FunctionData, 16> functions;
 };
 
 using Payload = std::variant<
@@ -76,6 +86,10 @@ using Payload = std::variant<
     PageInfo,
     EncodedPageImage,
     PageText,
+    AnnotationRecord,
+    std::vector<AnnotationRecord>,
+    NoteRecord,
+    std::vector<NoteRecord>,
     WorkspaceVerification>;
 
 struct AsyncWork final {
@@ -85,6 +99,10 @@ struct AsyncWork final {
     Operation operation;
     std::filesystem::path path;
     std::optional<DocumentId> document_id;
+    std::optional<DocumentVersionId> document_version_id;
+    std::optional<AnnotationId> annotation_id;
+    std::optional<CreateAnnotation> annotation;
+    std::optional<UpdateNote> note;
     std::size_t page_index = 0;
     double pixels_per_point = 1.0;
     Payload payload;
@@ -304,6 +322,86 @@ napi_value verification_value(napi_env env, const WorkspaceVerification& check) 
     return set_property(env, result, "issues", issues) ? result : nullptr;
 }
 
+const char* color_name(HighlightColor color) {
+    switch(color) {
+        case HighlightColor::yellow: return "yellow";
+        case HighlightColor::green: return "green";
+        case HighlightColor::blue: return "blue";
+        case HighlightColor::pink: return "pink";
+    }
+    return "yellow";
+}
+
+napi_value annotation_value(napi_env env, const AnnotationRecord& annotation) {
+    napi_value result = nullptr;
+    napi_value quads = nullptr;
+    napi_value quote = nullptr;
+    if(annotation.quads.size() > std::numeric_limits<std::uint32_t>::max()
+       || napi_create_object(env, &result) != napi_ok
+       || !set_string(env, result, "id", stable_id_to_hex(annotation.id))
+       || !set_string(env, result, "documentVersionId", stable_id_to_hex(annotation.document_version_id))
+       || !set_number(env, result, "pageIndex", annotation.page_index)
+       || !set_string(env, result, "layoutVersion", annotation.layout_version)
+       || !set_string(env, result, "color", color_name(annotation.color))
+       || napi_create_array_with_length(env, annotation.quads.size(), &quads) != napi_ok
+       || napi_create_object(env, &quote) != napi_ok
+       || !set_string(env, quote, "exact", annotation.quote.exact)
+       || !set_string(env, quote, "prefix", annotation.quote.prefix)
+       || !set_string(env, quote, "suffix", annotation.quote.suffix)
+       || !set_property(env, result, "quote", quote)) {
+        return nullptr;
+    }
+    for(std::size_t index = 0; index < annotation.quads.size(); ++index) {
+        const auto quad = rect_value(env, annotation.quads[index]);
+        if(quad == nullptr || napi_set_element(env, quads, static_cast<std::uint32_t>(index), quad) != napi_ok) {
+            return nullptr;
+        }
+    }
+    return set_property(env, result, "quads", quads) ? result : nullptr;
+}
+
+napi_value annotations_value(napi_env env, const std::vector<AnnotationRecord>& annotations) {
+    napi_value result = nullptr;
+    if(annotations.size() > std::numeric_limits<std::uint32_t>::max()
+       || napi_create_array_with_length(env, annotations.size(), &result) != napi_ok) {
+        return nullptr;
+    }
+    for(std::size_t index = 0; index < annotations.size(); ++index) {
+        const auto value = annotation_value(env, annotations[index]);
+        if(value == nullptr || napi_set_element(env, result, static_cast<std::uint32_t>(index), value) != napi_ok) {
+            return nullptr;
+        }
+    }
+    return result;
+}
+
+napi_value note_value(napi_env env, const NoteRecord& note) {
+    napi_value result = nullptr;
+    if(napi_create_object(env, &result) != napi_ok
+       || !set_string(env, result, "id", stable_id_to_hex(note.id))
+       || !set_string(env, result, "annotationId", stable_id_to_hex(note.annotation_id))
+       || !set_string(env, result, "markdownSource", note.markdown_source)
+       || !set_number(env, result, "revision", note.revision)) {
+        return nullptr;
+    }
+    return result;
+}
+
+napi_value notes_value(napi_env env, const std::vector<NoteRecord>& notes) {
+    napi_value result = nullptr;
+    if(notes.size() > std::numeric_limits<std::uint32_t>::max()
+       || napi_create_array_with_length(env, notes.size(), &result) != napi_ok) {
+        return nullptr;
+    }
+    for(std::size_t index = 0; index < notes.size(); ++index) {
+        const auto value = note_value(env, notes[index]);
+        if(value == nullptr || napi_set_element(env, result, static_cast<std::uint32_t>(index), value) != napi_ok) {
+            return nullptr;
+        }
+    }
+    return result;
+}
+
 template <typename T>
 void store(Result<T> result, AsyncWork& work) {
     if(result) {
@@ -342,6 +440,13 @@ void execute(napi_env, void* data) {
             case Operation::extract_page_text:
                 store(app.extract_page_text(work.page_index), work);
                 break;
+            case Operation::create_annotation: store(app.create_annotation(*work.annotation), work); break;
+            case Operation::list_annotations:
+                store(app.list_annotations(*work.document_version_id), work);
+                break;
+            case Operation::delete_annotation: store(app.delete_annotation(*work.annotation_id), work); break;
+            case Operation::update_note: store(app.update_note(*work.note), work); break;
+            case Operation::list_notes: store(app.list_notes(*work.document_version_id), work); break;
             case Operation::verify_workspace: store(app.verify_workspace(), work); break;
         }
     } catch(const std::exception& exception) {
@@ -372,6 +477,14 @@ napi_value payload_value(napi_env env, const Payload& payload) {
                 return rendered_page_value(env, value);
             } else if constexpr(std::is_same_v<T, PageText>) {
                 return page_text_value(env, value);
+            } else if constexpr(std::is_same_v<T, AnnotationRecord>) {
+                return annotation_value(env, value);
+            } else if constexpr(std::is_same_v<T, std::vector<AnnotationRecord>>) {
+                return annotations_value(env, value);
+            } else if constexpr(std::is_same_v<T, NoteRecord>) {
+                return note_value(env, value);
+            } else if constexpr(std::is_same_v<T, std::vector<NoteRecord>>) {
+                return notes_value(env, value);
             } else {
                 return verification_value(env, value);
             }
@@ -467,6 +580,150 @@ std::optional<std::size_t> page_index_argument(napi_env env, napi_value argument
     return static_cast<std::size_t>(*value);
 }
 
+std::optional<napi_value> named_property(
+    napi_env env,
+    napi_value object,
+    const char* name,
+    const char* message
+) {
+    napi_valuetype type = napi_undefined;
+    bool present = false;
+    napi_value value = nullptr;
+    if(napi_typeof(env, object, &type) != napi_ok || type != napi_object
+       || napi_has_named_property(env, object, name, &present) != napi_ok || !present
+       || napi_get_named_property(env, object, name, &value) != napi_ok) {
+        napi_throw_type_error(env, "INVALID_ARGUMENT", message);
+        return std::nullopt;
+    }
+    return value;
+}
+
+template <typename Tag>
+std::optional<StableId<Tag>> id_property(
+    napi_env env,
+    napi_value object,
+    const char* name,
+    const char* message
+) {
+    const auto property = named_property(env, object, name, message);
+    if(!property) return std::nullopt;
+    const auto text = string_argument(env, *property, message);
+    if(!text) return std::nullopt;
+    auto id = stable_id_from_hex<Tag>(*text);
+    if(!id) {
+        napi_throw_range_error(env, "INVALID_ARGUMENT", message);
+    }
+    return id;
+}
+
+std::optional<std::string> string_property(
+    napi_env env,
+    napi_value object,
+    const char* name,
+    const char* message
+) {
+    const auto property = named_property(env, object, name, message);
+    return property ? string_argument(env, *property, message) : std::nullopt;
+}
+
+std::optional<double> number_property(
+    napi_env env,
+    napi_value object,
+    const char* name,
+    const char* message
+) {
+    const auto property = named_property(env, object, name, message);
+    return property ? number_argument(env, *property, message) : std::nullopt;
+}
+
+std::optional<CreateAnnotation> annotation_argument(napi_env env, napi_value argument) {
+    const auto version_id = id_property<DocumentVersionIdTag>(
+        env, argument, "documentVersionId", "Document version ID must be 32 hexadecimal characters"
+    );
+    const auto page_property = named_property(
+        env, argument, "pageIndex", "Annotation pageIndex is required"
+    );
+    const auto layout_version = string_property(
+        env, argument, "layoutVersion", "Annotation layoutVersion must be a string"
+    );
+    const auto color_text = string_property(env, argument, "color", "Annotation color must be a string");
+    const auto quote_property = named_property(env, argument, "quote", "Annotation quote is required");
+    const auto quads_property = named_property(env, argument, "quads", "Annotation quads are required");
+    if(!version_id || !page_property || !layout_version || !color_text || !quote_property || !quads_property) {
+        return std::nullopt;
+    }
+    const auto page_index = page_index_argument(env, *page_property);
+    const auto exact = string_property(env, *quote_property, "exact", "Quote exact must be a string");
+    const auto prefix = string_property(env, *quote_property, "prefix", "Quote prefix must be a string");
+    const auto suffix = string_property(env, *quote_property, "suffix", "Quote suffix must be a string");
+    if(!page_index || !exact || !prefix || !suffix) return std::nullopt;
+
+    HighlightColor color = HighlightColor::yellow;
+    if(*color_text == "green") color = HighlightColor::green;
+    else if(*color_text == "blue") color = HighlightColor::blue;
+    else if(*color_text == "pink") color = HighlightColor::pink;
+    else if(*color_text != "yellow") {
+        napi_throw_range_error(env, "INVALID_ARGUMENT", "Annotation color is unsupported");
+        return std::nullopt;
+    }
+
+    bool is_array = false;
+    std::uint32_t length = 0;
+    if(napi_is_array(env, *quads_property, &is_array) != napi_ok || !is_array
+       || napi_get_array_length(env, *quads_property, &length) != napi_ok || length == 0U) {
+        napi_throw_type_error(env, "INVALID_ARGUMENT", "Annotation quads must be a non-empty array");
+        return std::nullopt;
+    }
+    std::vector<PageRect> quads;
+    quads.reserve(length);
+    for(std::uint32_t index = 0; index < length; ++index) {
+        napi_value quad = nullptr;
+        if(napi_get_element(env, *quads_property, index, &quad) != napi_ok) {
+            napi_throw_type_error(env, "INVALID_ARGUMENT", "Annotation quad could not be read");
+            return std::nullopt;
+        }
+        const auto x = number_property(env, quad, "x", "Annotation quad x must be a number");
+        const auto y = number_property(env, quad, "y", "Annotation quad y must be a number");
+        const auto width = number_property(env, quad, "width", "Annotation quad width must be a number");
+        const auto height = number_property(env, quad, "height", "Annotation quad height must be a number");
+        if(!x || !y || !width || !height) return std::nullopt;
+        quads.push_back(PageRect{.x = *x, .y = *y, .width = *width, .height = *height});
+    }
+    return CreateAnnotation{
+        .document_version_id = *version_id,
+        .page_index = *page_index,
+        .quads = std::move(quads),
+        .quote = QuoteAnchor{.exact = *exact, .prefix = *prefix, .suffix = *suffix},
+        .layout_version = *layout_version,
+        .color = color,
+    };
+}
+
+std::optional<UpdateNote> note_argument(napi_env env, napi_value argument) {
+    const auto annotation_id = id_property<AnnotationIdTag>(
+        env, argument, "annotationId", "Annotation ID must be 32 hexadecimal characters"
+    );
+    const auto revision = number_property(
+        env, argument, "expectedRevision", "Expected revision must be a non-negative integer"
+    );
+    const auto markdown = string_property(
+        env, argument, "markdownSource", "Markdown source must be a string"
+    );
+    constexpr double maximum_safe_integer = 9'007'199'254'740'991.0;
+    if(!annotation_id || !revision || !markdown || !std::isfinite(*revision) || *revision < 0.0
+       || std::floor(*revision) != *revision || *revision > maximum_safe_integer) {
+        if(annotation_id && revision && markdown) {
+            napi_throw_range_error(env, "INVALID_ARGUMENT", "Expected revision must be a non-negative integer");
+        }
+        return std::nullopt;
+    }
+    return UpdateNote{
+        .annotation_id = *annotation_id,
+        .expected_revision = static_cast<std::uint64_t>(*revision),
+        .markdown_source = *markdown,
+    };
+}
+
 napi_value schedule(napi_env env, napi_callback_info info) {
     void* raw_data = nullptr;
     std::size_t count = 0;
@@ -531,6 +788,47 @@ napi_value schedule(napi_env env, napi_callback_info info) {
                 );
                 return nullptr;
             }
+            break;
+        }
+        case Operation::list_annotations:
+        case Operation::list_notes: {
+            if(!expect_count(1, "Expected one document version ID argument")) return nullptr;
+            const auto value = string_argument(
+                env, arguments[0], "Document version ID must be a hexadecimal string"
+            );
+            if(!value) return nullptr;
+            work->document_version_id = stable_id_from_hex<DocumentVersionIdTag>(*value);
+            if(!work->document_version_id) {
+                napi_throw_range_error(
+                    env, "INVALID_ARGUMENT", "Document version ID must contain exactly 32 hexadecimal characters"
+                );
+                return nullptr;
+            }
+            break;
+        }
+        case Operation::delete_annotation: {
+            if(!expect_count(1, "Expected one annotation ID argument")) return nullptr;
+            const auto value = string_argument(env, arguments[0], "Annotation ID must be a hexadecimal string");
+            if(!value) return nullptr;
+            work->annotation_id = stable_id_from_hex<AnnotationIdTag>(*value);
+            if(!work->annotation_id) {
+                napi_throw_range_error(
+                    env, "INVALID_ARGUMENT", "Annotation ID must contain exactly 32 hexadecimal characters"
+                );
+                return nullptr;
+            }
+            break;
+        }
+        case Operation::create_annotation: {
+            if(!expect_count(1, "Expected one annotation argument")) return nullptr;
+            work->annotation = annotation_argument(env, arguments[0]);
+            if(!work->annotation) return nullptr;
+            break;
+        }
+        case Operation::update_note: {
+            if(!expect_count(1, "Expected one note argument")) return nullptr;
+            work->note = note_argument(env, arguments[0]);
+            if(!work->note) return nullptr;
             break;
         }
         case Operation::page_info:
@@ -654,7 +952,7 @@ Napi::Object initialize(Napi::Env env, Napi::Object exports) {
     auto context = std::make_unique<AddonContext>(
         std::make_shared<RuntimeState>(std::move(runtime).value())
     );
-    constexpr std::array<const char*, 11> names{
+    constexpr std::array<const char*, 16> names{
         "createWorkspace",
         "openWorkspace",
         "closeWorkspace",
@@ -665,6 +963,11 @@ Napi::Object initialize(Napi::Env env, Napi::Object exports) {
         "pageInfo",
         "renderPage",
         "extractPageText",
+        "createAnnotation",
+        "listAnnotations",
+        "deleteAnnotation",
+        "updateNote",
+        "listNotes",
         "verifyWorkspace",
     };
     exports.Set(

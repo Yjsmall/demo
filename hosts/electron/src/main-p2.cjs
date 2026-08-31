@@ -46,7 +46,7 @@ app.whenReady().then(() => {
     if (
       message?.status === 'ok'
       && message.processType === 'utility'
-      && message.runtimeInfo?.applicationApiVersion === 3
+      && message.runtimeInfo?.applicationApiVersion === 4
       && message.workspaceId === message.reopenedWorkspaceId
       && message.documentCount === 1
       && message.verification?.valid === true
@@ -60,6 +60,14 @@ app.whenReady().then(() => {
       && message.pageText?.text?.includes('Context Reader P1')
       && message.pageText?.lineCount === 1
       && message.pageText?.firstLine?.bounds?.width > 0
+      && message.annotationCount === 1
+      && message.annotation?.quote?.exact?.includes('Context Reader P1')
+      && message.annotation?.quads?.[0]?.width > 0
+      && message.noteCount === 1
+      && message.note?.revision === 2
+      && message.note?.markdownSource === 'Restored **context** note'
+      && message.updatedNoteRevision === 2
+      && message.conflictCode === 'CONFLICT'
     ) {
       finish(
         0,

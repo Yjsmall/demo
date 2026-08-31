@@ -32,8 +32,44 @@ async function run() {
     const page = await readerNode.pageInfo(0);
     const rendered = await readerNode.renderPage(0, 1);
     const pageText = await readerNode.extractPageText(0);
-    const verification = await readerNode.verifyWorkspace();
+    const annotation = await readerNode.createAnnotation({
+      documentVersionId: documents[0].versionId,
+      pageIndex: 0,
+      quads: [pageText.lines[0].bounds],
+      quote: {
+        exact: pageText.lines[0].text,
+        prefix: '',
+        suffix: '',
+      },
+      layoutVersion: 'mupdf-1.28.3',
+      color: 'yellow',
+    });
+    const initialNote = await readerNode.updateNote({
+      annotationId: annotation.id,
+      expectedRevision: 0,
+      markdownSource: 'First **context** note',
+    });
+    let conflictCode = null;
+    try {
+      await readerNode.updateNote({
+        annotationId: annotation.id,
+        expectedRevision: 0,
+        markdownSource: 'stale note',
+      });
+    } catch (error) {
+      conflictCode = error?.code;
+    }
+    const updatedNote = await readerNode.updateNote({
+      annotationId: annotation.id,
+      expectedRevision: initialNote.revision,
+      markdownSource: 'Restored **context** note',
+    });
     await readerNode.closeDocument();
+    await readerNode.closeWorkspace();
+    await readerNode.openWorkspace(workspacePath);
+    const annotations = await readerNode.listAnnotations(documents[0].versionId);
+    const notes = await readerNode.listNotes(documents[0].versionId);
+    const verification = await readerNode.verifyWorkspace();
     await readerNode.closeWorkspace();
 
     const expectedPngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -61,6 +97,12 @@ async function run() {
         lineCount: pageText.lines.length,
         firstLine: pageText.lines[0],
       },
+      annotationCount: annotations.length,
+      annotation: annotations[0],
+      noteCount: notes.length,
+      note: notes[0],
+      updatedNoteRevision: updatedNote.revision,
+      conflictCode,
       verification,
     });
   } finally {

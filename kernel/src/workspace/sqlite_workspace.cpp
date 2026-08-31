@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -22,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "context_reader/annotation/annotation.hpp"
 #include "context_reader/shared/error.hpp"
 #include "context_reader/shared/result.hpp"
 
@@ -29,7 +31,7 @@ namespace context_reader {
 
 namespace {
 
-constexpr std::uint32_t current_schema_version = 1;
+constexpr std::uint32_t current_schema_version = 2;
 
 class AlgorithmHandle final {
 public:
@@ -301,6 +303,39 @@ template <typename Id>
     );
 }
 
+template <typename Id>
+[[nodiscard]] Result<Id> create_id(sqlite3* database) {
+    auto statement_result = prepare(database, "SELECT randomblob(16)");
+    if(!statement_result) {
+        return Result<Id>::failure(statement_result.error());
+    }
+    auto statement = std::move(statement_result).value();
+    if(sqlite3_step(statement.get()) != SQLITE_ROW) {
+        return Result<Id>::failure(Error(ErrorCode::storage_failure, "SQLite ID generation failed"));
+    }
+    return read_id<Id>(statement.get(), 0);
+}
+
+[[nodiscard]] const char* color_name(HighlightColor color) noexcept {
+    switch(color) {
+        case HighlightColor::yellow: return "yellow";
+        case HighlightColor::green: return "green";
+        case HighlightColor::blue: return "blue";
+        case HighlightColor::pink: return "pink";
+    }
+    return "yellow";
+}
+
+[[nodiscard]] Result<HighlightColor> read_color(std::string_view color) {
+    if(color == "yellow") return Result<HighlightColor>::success(HighlightColor::yellow);
+    if(color == "green") return Result<HighlightColor>::success(HighlightColor::green);
+    if(color == "blue") return Result<HighlightColor>::success(HighlightColor::blue);
+    if(color == "pink") return Result<HighlightColor>::success(HighlightColor::pink);
+    return Result<HighlightColor>::failure(
+        Error(ErrorCode::storage_failure, "SQLite annotation color is invalid")
+    );
+}
+
 [[nodiscard]] Result<DocumentRecord> read_document_record(sqlite3_stmt* statement) {
     auto document_id = read_id<DocumentId>(statement, 0);
     auto version_id = read_id<DocumentVersionId>(statement, 1);
@@ -388,6 +423,8 @@ template <typename Id>
     return Result<void>::success();
 }
 
+[[nodiscard]] Result<std::size_t> query_count(sqlite3* database, const char* sql);
+
 [[nodiscard]] Result<void> apply_initial_migration(sqlite3* database) {
     constexpr const char* migration = R"sql(
 BEGIN IMMEDIATE;
@@ -414,12 +451,98 @@ CREATE TABLE document_versions (
     created_at INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX document_versions_document_id_idx ON document_versions(document_id);
+CREATE TABLE annotations (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+    document_version_id BLOB NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+    page_index INTEGER NOT NULL CHECK (page_index >= 0),
+    quote_exact TEXT NOT NULL,
+    quote_prefix TEXT NOT NULL,
+    quote_suffix TEXT NOT NULL,
+    layout_version TEXT NOT NULL,
+    color TEXT NOT NULL CHECK (color IN ('yellow', 'green', 'blue', 'pink')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX annotations_version_page_idx ON annotations(document_version_id, page_index);
+CREATE TABLE annotation_quads (
+    annotation_id BLOB NOT NULL REFERENCES annotations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    x REAL NOT NULL,
+    y REAL NOT NULL,
+    width REAL NOT NULL CHECK (width > 0),
+    height REAL NOT NULL CHECK (height > 0),
+    PRIMARY KEY(annotation_id, ordinal)
+) STRICT;
+CREATE TABLE notes (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+    annotation_id BLOB NOT NULL UNIQUE REFERENCES annotations(id) ON DELETE CASCADE,
+    markdown_source TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+) STRICT;
 INSERT INTO workspace_metadata(singleton, workspace_id, schema_version, created_at)
-VALUES (1, randomblob(16), 1, unixepoch());
-PRAGMA user_version = 1;
+VALUES (1, randomblob(16), 2, unixepoch());
+PRAGMA user_version = 2;
 COMMIT;
 )sql";
 
+    auto result = execute(database, migration);
+    if(!result) {
+        sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
+    }
+    return result;
+}
+
+[[nodiscard]] Result<void> migrate_database(sqlite3* database) {
+    auto version_result = query_count(database, "PRAGMA user_version");
+    if(!version_result) {
+        return Result<void>::failure(version_result.error());
+    }
+    if(version_result.value() == current_schema_version) {
+        return Result<void>::success();
+    }
+    if(version_result.value() != 1U) {
+        return Result<void>::failure(
+            Error(ErrorCode::unsupported_document, "Workspace schema version is unsupported")
+        );
+    }
+    constexpr const char* migration = R"sql(
+BEGIN IMMEDIATE;
+CREATE TABLE annotations (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+    document_version_id BLOB NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+    page_index INTEGER NOT NULL CHECK (page_index >= 0),
+    quote_exact TEXT NOT NULL,
+    quote_prefix TEXT NOT NULL,
+    quote_suffix TEXT NOT NULL,
+    layout_version TEXT NOT NULL,
+    color TEXT NOT NULL CHECK (color IN ('yellow', 'green', 'blue', 'pink')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX annotations_version_page_idx ON annotations(document_version_id, page_index);
+CREATE TABLE annotation_quads (
+    annotation_id BLOB NOT NULL REFERENCES annotations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    x REAL NOT NULL,
+    y REAL NOT NULL,
+    width REAL NOT NULL CHECK (width > 0),
+    height REAL NOT NULL CHECK (height > 0),
+    PRIMARY KEY(annotation_id, ordinal)
+) STRICT;
+CREATE TABLE notes (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+    annotation_id BLOB NOT NULL UNIQUE REFERENCES annotations(id) ON DELETE CASCADE,
+    markdown_source TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+) STRICT;
+UPDATE workspace_metadata SET schema_version = 2 WHERE singleton = 1;
+PRAGMA user_version = 2;
+COMMIT;
+)sql";
     auto result = execute(database, migration);
     if(!result) {
         sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
@@ -732,6 +855,339 @@ public:
         );
     }
 
+    [[nodiscard]] Result<AnnotationRecord> create_annotation(const CreateAnnotation& command) {
+        const std::scoped_lock lock(mutex_);
+        if(command.quads.empty() || command.quote.exact.empty() || command.layout_version.empty()
+           || command.page_index > static_cast<std::size_t>(std::numeric_limits<sqlite3_int64>::max())) {
+            return Result<AnnotationRecord>::failure(
+                Error(ErrorCode::invalid_argument, "Annotation anchor is incomplete")
+            );
+        }
+        for(const auto& quad : command.quads) {
+            if(!std::isfinite(quad.x) || !std::isfinite(quad.y) || !std::isfinite(quad.width)
+               || !std::isfinite(quad.height) || quad.width <= 0.0 || quad.height <= 0.0) {
+                return Result<AnnotationRecord>::failure(
+                    Error(ErrorCode::invalid_argument, "Annotation quad is invalid")
+                );
+            }
+        }
+
+        auto version_lookup = prepare(
+            database_.get(),
+            "SELECT page_count FROM document_versions WHERE id = ?1"
+        );
+        if(!version_lookup || !bind_id(version_lookup.value().get(), 1, command.document_version_id)) {
+            return Result<AnnotationRecord>::failure(
+                Error(ErrorCode::storage_failure, "Document version lookup could not be prepared")
+            );
+        }
+        const auto version_step = sqlite3_step(version_lookup.value().get());
+        if(version_step == SQLITE_DONE) {
+            return Result<AnnotationRecord>::failure(
+                Error(ErrorCode::not_found, "Document version was not found")
+            );
+        }
+        if(version_step != SQLITE_ROW
+           || command.page_index >= static_cast<std::size_t>(sqlite3_column_int64(version_lookup.value().get(), 0))) {
+            return Result<AnnotationRecord>::failure(
+                Error(ErrorCode::invalid_argument, "Annotation page index is out of range")
+            );
+        }
+
+        auto id_result = create_id<AnnotationId>(database_.get());
+        if(!id_result) {
+            return Result<AnnotationRecord>::failure(id_result.error());
+        }
+        const auto id = id_result.value();
+        Transaction transaction(database_.get());
+        auto begin_result = execute(database_.get(), "BEGIN IMMEDIATE");
+        if(!begin_result) {
+            return Result<AnnotationRecord>::failure(begin_result.error());
+        }
+        transaction.begin();
+
+        auto annotation_insert = prepare(
+            database_.get(),
+            "INSERT INTO annotations(id, document_version_id, page_index, quote_exact, "
+            "quote_prefix, quote_suffix, layout_version, color, created_at, updated_at) "
+            "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch(), unixepoch())"
+        );
+        if(!annotation_insert || !bind_id(annotation_insert.value().get(), 1, id)
+           || !bind_id(annotation_insert.value().get(), 2, command.document_version_id)
+           || sqlite3_bind_int64(annotation_insert.value().get(), 3, static_cast<sqlite3_int64>(command.page_index)) != SQLITE_OK
+           || !bind_text(annotation_insert.value().get(), 4, command.quote.exact)
+           || !bind_text(annotation_insert.value().get(), 5, command.quote.prefix)
+           || !bind_text(annotation_insert.value().get(), 6, command.quote.suffix)
+           || !bind_text(annotation_insert.value().get(), 7, command.layout_version)
+           || !bind_text(annotation_insert.value().get(), 8, color_name(command.color))
+           || sqlite3_step(annotation_insert.value().get()) != SQLITE_DONE) {
+            return Result<AnnotationRecord>::failure(
+                Error(ErrorCode::storage_failure, "Annotation could not be inserted")
+            );
+        }
+
+        auto quad_insert = prepare(
+            database_.get(),
+            "INSERT INTO annotation_quads(annotation_id, ordinal, x, y, width, height) "
+            "VALUES(?1, ?2, ?3, ?4, ?5, ?6)"
+        );
+        if(!quad_insert) {
+            return Result<AnnotationRecord>::failure(quad_insert.error());
+        }
+        for(std::size_t index = 0; index < command.quads.size(); ++index) {
+            const auto& quad = command.quads[index];
+            auto* statement = quad_insert.value().get();
+            sqlite3_reset(statement);
+            sqlite3_clear_bindings(statement);
+            if(!bind_id(statement, 1, id)
+               || sqlite3_bind_int64(statement, 2, static_cast<sqlite3_int64>(index)) != SQLITE_OK
+               || sqlite3_bind_double(statement, 3, quad.x) != SQLITE_OK
+               || sqlite3_bind_double(statement, 4, quad.y) != SQLITE_OK
+               || sqlite3_bind_double(statement, 5, quad.width) != SQLITE_OK
+               || sqlite3_bind_double(statement, 6, quad.height) != SQLITE_OK
+               || sqlite3_step(statement) != SQLITE_DONE) {
+                return Result<AnnotationRecord>::failure(
+                    Error(ErrorCode::storage_failure, "Annotation quad could not be inserted")
+                );
+            }
+        }
+        auto commit_result = execute(database_.get(), "COMMIT");
+        if(!commit_result) {
+            return Result<AnnotationRecord>::failure(commit_result.error());
+        }
+        transaction.commit();
+        return Result<AnnotationRecord>::success(AnnotationRecord{
+            .id = id,
+            .document_version_id = command.document_version_id,
+            .page_index = command.page_index,
+            .quads = command.quads,
+            .quote = command.quote,
+            .layout_version = command.layout_version,
+            .color = command.color,
+        });
+    }
+
+    [[nodiscard]] Result<std::vector<AnnotationRecord>> list_annotations(
+        DocumentVersionId document_version_id
+    ) {
+        const std::scoped_lock lock(mutex_);
+        auto annotations_result = prepare(
+            database_.get(),
+            "SELECT id, document_version_id, page_index, quote_exact, quote_prefix, quote_suffix, "
+            "layout_version, color FROM annotations WHERE document_version_id = ?1 "
+            "ORDER BY page_index, created_at, rowid"
+        );
+        if(!annotations_result || !bind_id(annotations_result.value().get(), 1, document_version_id)) {
+            return Result<std::vector<AnnotationRecord>>::failure(
+                Error(ErrorCode::storage_failure, "Annotations could not be listed")
+            );
+        }
+        auto annotations = std::move(annotations_result).value();
+        std::vector<AnnotationRecord> records;
+        int step_result = SQLITE_ROW;
+        while((step_result = sqlite3_step(annotations.get())) == SQLITE_ROW) {
+            auto id = read_id<AnnotationId>(annotations.get(), 0);
+            auto version_id = read_id<DocumentVersionId>(annotations.get(), 1);
+            const auto page_index = sqlite3_column_int64(annotations.get(), 2);
+            const auto* exact = reinterpret_cast<const char*>(sqlite3_column_text(annotations.get(), 3));
+            const auto* prefix = reinterpret_cast<const char*>(sqlite3_column_text(annotations.get(), 4));
+            const auto* suffix = reinterpret_cast<const char*>(sqlite3_column_text(annotations.get(), 5));
+            const auto* layout = reinterpret_cast<const char*>(sqlite3_column_text(annotations.get(), 6));
+            const auto* color_text = reinterpret_cast<const char*>(sqlite3_column_text(annotations.get(), 7));
+            if(!id || !version_id || page_index < 0 || exact == nullptr || prefix == nullptr
+               || suffix == nullptr || layout == nullptr || color_text == nullptr) {
+                return Result<std::vector<AnnotationRecord>>::failure(
+                    Error(ErrorCode::storage_failure, "SQLite annotation record is invalid")
+                );
+            }
+            auto color = read_color(color_text);
+            if(!color) {
+                return Result<std::vector<AnnotationRecord>>::failure(color.error());
+            }
+            auto quads_result = prepare(
+                database_.get(),
+                "SELECT x, y, width, height FROM annotation_quads WHERE annotation_id = ?1 ORDER BY ordinal"
+            );
+            if(!quads_result || !bind_id(quads_result.value().get(), 1, id.value())) {
+                return Result<std::vector<AnnotationRecord>>::failure(
+                    Error(ErrorCode::storage_failure, "Annotation quads could not be listed")
+                );
+            }
+            std::vector<PageRect> quads;
+            int quad_step = SQLITE_ROW;
+            while((quad_step = sqlite3_step(quads_result.value().get())) == SQLITE_ROW) {
+                quads.push_back(PageRect{
+                    .x = sqlite3_column_double(quads_result.value().get(), 0),
+                    .y = sqlite3_column_double(quads_result.value().get(), 1),
+                    .width = sqlite3_column_double(quads_result.value().get(), 2),
+                    .height = sqlite3_column_double(quads_result.value().get(), 3),
+                });
+            }
+            if(quad_step != SQLITE_DONE || quads.empty()) {
+                return Result<std::vector<AnnotationRecord>>::failure(
+                    Error(ErrorCode::storage_failure, "SQLite annotation quads are invalid")
+                );
+            }
+            records.push_back(AnnotationRecord{
+                .id = id.value(),
+                .document_version_id = version_id.value(),
+                .page_index = static_cast<std::size_t>(page_index),
+                .quads = std::move(quads),
+                .quote = QuoteAnchor{.exact = exact, .prefix = prefix, .suffix = suffix},
+                .layout_version = layout,
+                .color = color.value(),
+            });
+        }
+        if(step_result != SQLITE_DONE) {
+            return Result<std::vector<AnnotationRecord>>::failure(
+                Error(ErrorCode::storage_failure, "Annotations could not be listed")
+            );
+        }
+        return Result<std::vector<AnnotationRecord>>::success(std::move(records));
+    }
+
+    [[nodiscard]] Result<void> delete_annotation(AnnotationId annotation_id) {
+        const std::scoped_lock lock(mutex_);
+        auto statement_result = prepare(database_.get(), "DELETE FROM annotations WHERE id = ?1");
+        if(!statement_result || !bind_id(statement_result.value().get(), 1, annotation_id)
+           || sqlite3_step(statement_result.value().get()) != SQLITE_DONE) {
+            return Result<void>::failure(
+                Error(ErrorCode::storage_failure, "Annotation could not be deleted")
+            );
+        }
+        if(sqlite3_changes(database_.get()) != 1) {
+            return Result<void>::failure(Error(ErrorCode::not_found, "Annotation was not found"));
+        }
+        return Result<void>::success();
+    }
+
+    [[nodiscard]] Result<NoteRecord> update_note(const UpdateNote& command) {
+        const std::scoped_lock lock(mutex_);
+        auto lookup_result = prepare(
+            database_.get(),
+            "SELECT n.id, n.revision FROM annotations a LEFT JOIN notes n ON n.annotation_id = a.id "
+            "WHERE a.id = ?1"
+        );
+        if(!lookup_result || !bind_id(lookup_result.value().get(), 1, command.annotation_id)) {
+            return Result<NoteRecord>::failure(
+                Error(ErrorCode::storage_failure, "Note lookup could not be prepared")
+            );
+        }
+        auto lookup = std::move(lookup_result).value();
+        const auto step_result = sqlite3_step(lookup.get());
+        if(step_result == SQLITE_DONE) {
+            return Result<NoteRecord>::failure(Error(ErrorCode::not_found, "Annotation was not found"));
+        }
+        if(step_result != SQLITE_ROW) {
+            return Result<NoteRecord>::failure(Error(ErrorCode::storage_failure, "Note lookup failed"));
+        }
+
+        if(sqlite3_column_type(lookup.get(), 0) == SQLITE_NULL) {
+            if(command.expected_revision != 0U) {
+                return Result<NoteRecord>::failure(
+                    Error(ErrorCode::conflict, "Note revision does not match")
+                );
+            }
+            auto id_result = create_id<NoteId>(database_.get());
+            if(!id_result) {
+                return Result<NoteRecord>::failure(id_result.error());
+            }
+            auto insert_result = prepare(
+                database_.get(),
+                "INSERT INTO notes(id, annotation_id, markdown_source, revision, created_at, updated_at) "
+                "VALUES(?1, ?2, ?3, 1, unixepoch(), unixepoch())"
+            );
+            if(!insert_result || !bind_id(insert_result.value().get(), 1, id_result.value())
+               || !bind_id(insert_result.value().get(), 2, command.annotation_id)
+               || !bind_text(insert_result.value().get(), 3, command.markdown_source)
+               || sqlite3_step(insert_result.value().get()) != SQLITE_DONE) {
+                return Result<NoteRecord>::failure(
+                    Error(ErrorCode::storage_failure, "Note could not be created")
+                );
+            }
+            return Result<NoteRecord>::success(NoteRecord{
+                .id = id_result.value(),
+                .annotation_id = command.annotation_id,
+                .markdown_source = command.markdown_source,
+                .revision = 1U,
+            });
+        }
+
+        auto note_id = read_id<NoteId>(lookup.get(), 0);
+        const auto revision = sqlite3_column_int64(lookup.get(), 1);
+        if(!note_id || revision <= 0 || static_cast<std::uint64_t>(revision) != command.expected_revision
+           || revision == std::numeric_limits<sqlite3_int64>::max()) {
+            return Result<NoteRecord>::failure(
+                Error(ErrorCode::conflict, "Note revision does not match")
+            );
+        }
+        const auto next_revision = revision + 1;
+        auto update_result = prepare(
+            database_.get(),
+            "UPDATE notes SET markdown_source = ?1, revision = ?2, updated_at = unixepoch() "
+            "WHERE id = ?3 AND revision = ?4"
+        );
+        if(!update_result || !bind_text(update_result.value().get(), 1, command.markdown_source)
+           || sqlite3_bind_int64(update_result.value().get(), 2, next_revision) != SQLITE_OK
+           || !bind_id(update_result.value().get(), 3, note_id.value())
+           || sqlite3_bind_int64(update_result.value().get(), 4, revision) != SQLITE_OK
+           || sqlite3_step(update_result.value().get()) != SQLITE_DONE
+           || sqlite3_changes(database_.get()) != 1) {
+            return Result<NoteRecord>::failure(
+                Error(ErrorCode::conflict, "Note revision does not match")
+            );
+        }
+        return Result<NoteRecord>::success(NoteRecord{
+            .id = note_id.value(),
+            .annotation_id = command.annotation_id,
+            .markdown_source = command.markdown_source,
+            .revision = static_cast<std::uint64_t>(next_revision),
+        });
+    }
+
+    [[nodiscard]] Result<std::vector<NoteRecord>> list_notes(
+        DocumentVersionId document_version_id
+    ) {
+        const std::scoped_lock lock(mutex_);
+        auto statement_result = prepare(
+            database_.get(),
+            "SELECT n.id, n.annotation_id, n.markdown_source, n.revision FROM notes n "
+            "JOIN annotations a ON a.id = n.annotation_id WHERE a.document_version_id = ?1 "
+            "ORDER BY n.created_at, n.rowid"
+        );
+        if(!statement_result || !bind_id(statement_result.value().get(), 1, document_version_id)) {
+            return Result<std::vector<NoteRecord>>::failure(
+                Error(ErrorCode::storage_failure, "Notes could not be listed")
+            );
+        }
+        auto statement = std::move(statement_result).value();
+        std::vector<NoteRecord> notes;
+        int step_result = SQLITE_ROW;
+        while((step_result = sqlite3_step(statement.get())) == SQLITE_ROW) {
+            auto note_id = read_id<NoteId>(statement.get(), 0);
+            auto annotation_id = read_id<AnnotationId>(statement.get(), 1);
+            const auto* markdown = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 2));
+            const auto revision = sqlite3_column_int64(statement.get(), 3);
+            if(!note_id || !annotation_id || markdown == nullptr || revision <= 0) {
+                return Result<std::vector<NoteRecord>>::failure(
+                    Error(ErrorCode::storage_failure, "SQLite note record is invalid")
+                );
+            }
+            notes.push_back(NoteRecord{
+                .id = note_id.value(),
+                .annotation_id = annotation_id.value(),
+                .markdown_source = markdown,
+                .revision = static_cast<std::uint64_t>(revision),
+            });
+        }
+        if(step_result != SQLITE_DONE) {
+            return Result<std::vector<NoteRecord>>::failure(
+                Error(ErrorCode::storage_failure, "Notes could not be listed")
+            );
+        }
+        return Result<std::vector<NoteRecord>>::success(std::move(notes));
+    }
+
     [[nodiscard]] Result<WorkspaceVerification> verify() {
         const std::scoped_lock lock(mutex_);
         WorkspaceVerification verification{
@@ -774,6 +1230,41 @@ public:
         }
         if(active_mismatch.value() != 0) {
             verification.issues.emplace_back("document_active_version_mismatch");
+        }
+
+        auto foreign_keys = prepare(database_.get(), "PRAGMA foreign_key_check");
+        if(!foreign_keys) {
+            return Result<WorkspaceVerification>::failure(foreign_keys.error());
+        }
+        const auto foreign_key_step = sqlite3_step(foreign_keys.value().get());
+        if(foreign_key_step == SQLITE_ROW) {
+            verification.issues.emplace_back("sqlite_foreign_key_violation");
+        } else if(foreign_key_step != SQLITE_DONE) {
+            return Result<WorkspaceVerification>::failure(
+                Error(ErrorCode::storage_failure, "SQLite foreign key check failed")
+            );
+        }
+
+        auto missing_quads = query_count(
+            database_.get(),
+            "SELECT count(*) FROM annotations a LEFT JOIN annotation_quads q ON q.annotation_id = a.id "
+            "WHERE q.annotation_id IS NULL"
+        );
+        auto page_mismatch = query_count(
+            database_.get(),
+            "SELECT count(*) FROM annotations a JOIN document_versions v ON v.id = a.document_version_id "
+            "WHERE a.page_index >= v.page_count"
+        );
+        if(!missing_quads || !page_mismatch) {
+            return Result<WorkspaceVerification>::failure(
+                !missing_quads ? missing_quads.error() : page_mismatch.error()
+            );
+        }
+        if(missing_quads.value() != 0U) {
+            verification.issues.emplace_back("annotation_anchor_missing_quads");
+        }
+        if(page_mismatch.value() != 0U) {
+            verification.issues.emplace_back("annotation_page_out_of_range");
         }
 
         auto objects_result = prepare(
@@ -978,6 +1469,10 @@ Result<std::unique_ptr<SqliteWorkspace>> SqliteWorkspace::open(
     if(!configuration) {
         return Result<std::unique_ptr<SqliteWorkspace>>::failure(configuration.error());
     }
+    auto migration = migrate_database(database.get());
+    if(!migration) {
+        return Result<std::unique_ptr<SqliteWorkspace>>::failure(migration.error());
+    }
     auto info_result = read_workspace_info(database.get());
     if(!info_result) {
         return Result<std::unique_ptr<SqliteWorkspace>>::failure(info_result.error());
@@ -1007,6 +1502,30 @@ Result<std::vector<DocumentRecord>> SqliteWorkspace::list_documents() {
 
 Result<ResolvedDocumentObject> SqliteWorkspace::resolve_document(DocumentId document_id) {
     return implementation_->resolve_document(document_id);
+}
+
+Result<AnnotationRecord> SqliteWorkspace::create_annotation(const CreateAnnotation& command) {
+    return implementation_->create_annotation(command);
+}
+
+Result<std::vector<AnnotationRecord>> SqliteWorkspace::list_annotations(
+    DocumentVersionId document_version_id
+) {
+    return implementation_->list_annotations(document_version_id);
+}
+
+Result<void> SqliteWorkspace::delete_annotation(AnnotationId annotation_id) {
+    return implementation_->delete_annotation(annotation_id);
+}
+
+Result<NoteRecord> SqliteWorkspace::update_note(const UpdateNote& command) {
+    return implementation_->update_note(command);
+}
+
+Result<std::vector<NoteRecord>> SqliteWorkspace::list_notes(
+    DocumentVersionId document_version_id
+) {
+    return implementation_->list_notes(document_version_id);
 }
 
 Result<WorkspaceVerification> SqliteWorkspace::verify() {
