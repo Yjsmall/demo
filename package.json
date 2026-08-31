@@ -10,6 +10,7 @@
     "smoke:electron": "node scripts/run-electron-smoke.cjs",
     "smoke:electron:p2": "node scripts/run-electron-p2-smoke.cjs",
     "smoke:electron:renderer": "node scripts/run-electron-renderer-smoke.cjs",
+    "smoke:electron:single-instance": "node scripts/run-electron-single-instance-smoke.cjs",
     "start:p2": "electron hosts/electron/src/main-app.cjs",
     "test:p0": "npm run native:build && npm run smoke:electron"
   },

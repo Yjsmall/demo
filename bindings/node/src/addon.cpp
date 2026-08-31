@@ -353,6 +353,7 @@ napi_value verification_value(napi_env env, const WorkspaceVerification& check) 
        || !set_number(env, result, "documentCount", check.document_count)
        || !set_number(env, result, "documentVersionCount", check.document_version_count)
        || !set_number(env, result, "referencedObjectCount", check.referenced_object_count)
+       || !set_number(env, result, "orphanedObjectCount", check.orphaned_object_count)
        || napi_create_array_with_length(env, check.issues.size(), &issues) != napi_ok) {
         return nullptr;
     }

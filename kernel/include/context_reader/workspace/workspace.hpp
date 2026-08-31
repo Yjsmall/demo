@@ -14,6 +14,13 @@ struct WorkspaceInfo final {
     std::uint32_t schema_version;
 };
 
+struct WorkspaceInspection final {
+    WorkspaceId id;
+    std::uint32_t schema_version;
+    std::uint32_t target_schema_version;
+    bool migration_required;
+};
+
 struct DocumentRecord final {
     DocumentId document_id;
     DocumentVersionId version_id;
@@ -34,7 +41,13 @@ struct WorkspaceVerification final {
     std::size_t document_count;
     std::size_t document_version_count;
     std::size_t referenced_object_count;
+    std::size_t orphaned_object_count;
     std::vector<std::string> issues;
+};
+
+struct OrphanCleanupResult final {
+    std::size_t removed_object_count;
+    std::uint64_t reclaimed_bytes;
 };
 
 }  // namespace context_reader

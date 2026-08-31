@@ -143,6 +143,10 @@ C++ Application Facade
 
 Renderer 保持沙箱化，不能加载原生模块。Utility Process 加载 `reader_node`；`reader_node` 与 `reader_core` 使用同一 C++20 工具链和构建产物，直接调用 Application Facade。它只负责参数转换、异步桥接、线程切换、Buffer 生命周期和错误映射，不实现业务规则。Utility Process 负责执行耗时和不可信 PDF 工作，进程退出后由 Electron Main 监管并重启。
 
+Electron 桌面产品采用应用单实例策略，不支持两个 Context Reader 实例并发运行。Main Process 启动时必须取得 Electron 应用单实例锁；第二次启动不能创建新的 Utility Process 或打开 Workspace，而应通知已有实例恢复并聚焦窗口，然后退出。
+
+应用单实例锁与 Kernel 的 Workspace 独占锁属于不同边界：前者落实桌面产品行为，后者维护所有 Host 和工具都必须遵守的单写者不变量。Workspace 锁主要防御旧 Utility Process 尚未完全退出时新 Utility 已启动、`reader-workspace` 与应用同时操作，或未来其他 Host 错误打开同一路径。它是纵深保护，不是多进程编辑能力。
+
 ### 5.2 原生嵌入模式
 
 ```text
@@ -207,6 +211,8 @@ adapters -> ports <- application
 ### 7.2 WorkspaceModule
 
 负责 Workspace 创建、打开、独占锁、数据库迁移、备份、恢复和导入导出。
+
+独占锁的语义是“同一 Workspace 同时只有一个写入者”。它不允许或协调两个应用共同编辑；冲突方必须收到 `Workspace Busy` 并停止打开。持锁进程退出或崩溃后，由操作系统释放锁，后续进程才能重新打开。
 
 ### 7.3 DocumentModule
 

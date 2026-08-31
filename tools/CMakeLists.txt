@@ -15,3 +15,11 @@ target_compile_definitions(
 )
 target_link_options(reader-probe PRIVATE -municode)
 context_reader_enable_warnings(reader-probe)
+
+if(CONTEXT_READER_ENABLE_WORKSPACE)
+    add_executable(reader-workspace workspace/main.cpp)
+    target_link_libraries(reader-workspace PRIVATE context_reader::core)
+    target_compile_features(reader-workspace PRIVATE cxx_std_20)
+    target_link_options(reader-workspace PRIVATE -municode)
+    context_reader_enable_warnings(reader-workspace)
+endif()

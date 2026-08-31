@@ -27,6 +27,9 @@ public:
         const std::filesystem::path& root,
         PdfEngine& pdf_engine
     );
+    [[nodiscard]] static Result<WorkspaceInspection> inspect(
+        const std::filesystem::path& root
+    );
 
     SqliteWorkspace(const SqliteWorkspace&) = delete;
     SqliteWorkspace& operator=(const SqliteWorkspace&) = delete;
@@ -51,6 +54,7 @@ public:
         DocumentVersionId document_version_id
     );
     [[nodiscard]] Result<WorkspaceVerification> verify();
+    [[nodiscard]] Result<OrphanCleanupResult> cleanup_orphaned_objects();
 
 private:
     class Impl;

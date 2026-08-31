@@ -6,7 +6,7 @@ Context Reader 是一个以 PDF 语境阅读、文本高亮和 Markdown 笔记�
 
 ## 当前状态
 
-当前仓库已完成 P0 工具链、P1 PDF 风险验证与 P2 Electron 纵向闭环。P2 包含 SQLite Workspace、内容寻址 PDF 导入、重启恢复、只读不变量检查，以及沙箱化 Electron Renderer 经限定 preload/IPC 到 Utility Process 和 Application Facade 的文档打开、页面渲染、文本选择、Quote Anchor 高亮与 revision 化 Markdown 笔记路径；导入、打开和渲染使用可取消 Job，Utility Process 在导入事务提交前后终止后均能重新打开工作区并通过不变量检查。下一阶段为 P3 数据与边界稳定。
+当前仓库已完成 P0 工具链、P1 PDF 风险验证与 P2 Electron 纵向闭环，并已开始 P3 数据与边界稳定。首批 P3 能力包括 Electron Main 单实例限制、Workspace 独占写入与崩溃释放、明确的 `WORKSPACE_BUSY`、孤立 PDF 对象检查/清理、schema v1 -> v2 迁移前 SQLite 备份，以及 `reader-workspace inspect/verify/migrate --dry-run`。Node-API 完整契约、Utility Process 重启竞态和真实 Replay 仍在后续 P3 工作中。
 
 ## 核心决策
 
@@ -46,6 +46,10 @@ pixi run p0
 pixi run p1
 pixi run p2
 npm run start:p2
+pixi run workspace inspect <workspace-path>
+pixi run workspace verify <workspace-path>
+pixi run workspace migrate <workspace-path> --dry-run
+pixi run p3-single-instance-smoke
 ```
 
 `pixi run p0` 会构建并测试 `reader_core`、重新安装锁定的 npm 依赖、编译 `reader_node`、检查 PE 导入边界，并由 Electron Utility Process 加载原生模块。
@@ -55,6 +59,10 @@ npm run start:p2
 `pixi run p2` 在 P1 基础上构建 SQLite Workspace 与 P2 `reader_node`，运行持久化/重启集成测试、PE 导入边界检查，并验证 Utility Process 及沙箱化 Renderer 两条真实 Electron 路径。Utility smoke 还会验证排队 Job 取消，以及导入事务提交前后终止进程后的恢复结果；Renderer smoke 会完成创建、导入、渲染、文本选择、高亮和笔记保存，并在 `build/renderer-p2-smoke.png` 留下非空像素检查通过的截图。
 
 `npm run start:p2` 启动当前 P2 桌面宿主。Renderer 只能使用 preload 暴露的限定 API；工作区和 PDF 路径必须先由 Main 文件对话框授权，原生模块、SQLite、MuPDF 和任意文件系统访问均不暴露给 Renderer。
+
+产品不支持同时运行两个 Context Reader 应用实例。Electron Main 启动时取得应用单实例锁；再次启动时，新实例立即退出，并由已有实例恢复和聚焦主窗口。`pixi run p3-single-instance-smoke` 会用隔离的用户数据目录启动两个真实 Electron 进程验证该行为。Kernel 的 `workspace.lock` 是独立的数据安全边界，只用于防御 Utility Process 重启短暂重叠、维护工具与应用冲突或未来其他宿主误用同一 Workspace；它不表示产品支持两个应用并发编辑。
+
+`reader-workspace` 的首个 P3 版本输出单行 JSON。所有命令遵守 Workspace 独占锁；`migrate --dry-run` 只报告当前与目标 schema，不修改数据库。`verify` 会报告 SQLite、引用对象与孤立对象问题；孤立对象清理由 Kernel 显式 API 提供，当前 CLI 不自动删除数据。
 
 ```powershell
 pixi run probe inspect tests\corpus\generated\basic-rotated-cropbox.pdf --output build\probe-output

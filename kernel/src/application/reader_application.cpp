@@ -69,7 +69,12 @@ Result<WorkspaceInfo> ReaderApplication::open_workspace(const std::filesystem::p
     if(!workspace_result) {
         return Result<WorkspaceInfo>::failure(workspace_result.error());
     }
-    implementation_->workspace = std::move(workspace_result).value();
+    auto workspace = std::move(workspace_result).value();
+    auto cleanup_result = workspace->cleanup_orphaned_objects();
+    if(!cleanup_result) {
+        return Result<WorkspaceInfo>::failure(cleanup_result.error());
+    }
+    implementation_->workspace = std::move(workspace);
     return Result<WorkspaceInfo>::success(implementation_->workspace->info());
 #else
     static_cast<void>(root);

@@ -87,6 +87,10 @@ if(TARGET reader-probe)
     context_reader_assert_target_links_only(reader-probe reader_core)
 endif()
 
+if(TARGET reader-workspace)
+    context_reader_assert_target_links_only(reader-workspace reader_core)
+endif()
+
 if(TARGET sqlite_workspace_test)
-    context_reader_assert_target_links_only(sqlite_workspace_test reader_core)
+    context_reader_assert_target_links_only(sqlite_workspace_test reader_core SQLite::SQLite3)
 endif()

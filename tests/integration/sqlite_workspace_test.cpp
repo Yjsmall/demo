@@ -2,9 +2,12 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string_view>
+
+#include <sqlite3.h>
 
 #include "context_reader/pdf/mupdf_engine.hpp"
 #include "context_reader/runtime/reader_runtime.hpp"
@@ -21,6 +24,75 @@ void check(bool condition, std::string_view message) {
         std::cerr << "FAILED: " << message << '\n';
         ++failures;
     }
+}
+
+bool create_schema_v1_workspace(const std::filesystem::path& root) {
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(root, filesystem_error);
+    if(filesystem_error) return false;
+    sqlite3* database = nullptr;
+    const auto path = root / "workspace.db";
+    const auto path_utf8 = path.u8string();
+    const std::string path_string(
+        reinterpret_cast<const char*>(path_utf8.data()),
+        path_utf8.size()
+    );
+    if(sqlite3_open(path_string.c_str(), &database) != SQLITE_OK) {
+        if(database != nullptr) sqlite3_close(database);
+        return false;
+    }
+    constexpr const char* schema = R"sql(
+CREATE TABLE workspace_metadata (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    workspace_id BLOB NOT NULL CHECK (length(workspace_id) = 16),
+    schema_version INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE documents (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+    title TEXT NOT NULL,
+    active_version_id BLOB,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (active_version_id) REFERENCES document_versions(id)
+) STRICT;
+CREATE TABLE document_versions (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+    document_id BLOB NOT NULL REFERENCES documents(id),
+    content_hash TEXT NOT NULL UNIQUE CHECK (length(content_hash) = 64),
+    object_key TEXT NOT NULL UNIQUE,
+    byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+    page_count INTEGER NOT NULL CHECK (page_count >= 0),
+    created_at INTEGER NOT NULL
+) STRICT;
+INSERT INTO workspace_metadata(singleton, workspace_id, schema_version, created_at)
+VALUES (1, randomblob(16), 1, unixepoch());
+PRAGMA user_version = 1;
+)sql";
+    const auto result = sqlite3_exec(database, schema, nullptr, nullptr, nullptr);
+    sqlite3_close(database);
+    return result == SQLITE_OK;
+}
+
+int database_user_version(const std::filesystem::path& path) {
+    sqlite3* database = nullptr;
+    const auto path_utf8 = path.u8string();
+    const std::string path_string(
+        reinterpret_cast<const char*>(path_utf8.data()),
+        path_utf8.size()
+    );
+    if(sqlite3_open_v2(path_string.c_str(), &database, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+        if(database != nullptr) sqlite3_close(database);
+        return -1;
+    }
+    sqlite3_stmt* statement = nullptr;
+    int version = -1;
+    if(sqlite3_prepare_v2(database, "PRAGMA user_version", -1, &statement, nullptr) == SQLITE_OK
+       && sqlite3_step(statement) == SQLITE_ROW) {
+        version = sqlite3_column_int(statement, 0);
+    }
+    if(statement != nullptr) sqlite3_finalize(statement);
+    sqlite3_close(database);
+    return version;
 }
 
 }  // namespace
@@ -55,6 +127,18 @@ int main() {
         std::filesystem::is_regular_file(workspace_root / "workspace.db"),
         "workspace database exists"
     );
+    check(
+        std::filesystem::is_regular_file(workspace_root / "workspace.lock"),
+        "workspace lock file exists"
+    );
+    const auto busy_open = SqliteWorkspace::open(workspace_root, pdf_engine);
+    check(!busy_open.has_value(), "second writer cannot open the workspace");
+    if(!busy_open) {
+        check(
+            busy_open.error().code() == ErrorCode::workspace_busy,
+            "second writer receives the stable workspace busy error"
+        );
+    }
 
     const auto corrupt = workspace->import_pdf(corpus_root / "generated" / "corrupt-truncated.pdf");
     check(!corrupt.has_value(), "corrupt PDF import is rejected");
@@ -113,6 +197,10 @@ int main() {
         check(
             initial_verification.value().referenced_object_count == 1U,
             "verification counts referenced objects"
+        );
+        check(
+            initial_verification.value().orphaned_object_count == 0U,
+            "verification reports no orphaned objects"
         );
     }
 
@@ -216,12 +304,63 @@ int main() {
         "restored workspace verifies after restart"
     );
 
+    const auto orphan_path = workspace_root / "objects" / "pdf" / "ff" / "orphan.pdf";
+    std::filesystem::create_directories(orphan_path.parent_path(), filesystem_error);
+    {
+        std::ofstream orphan(orphan_path, std::ios::binary);
+        orphan << "orphan";
+    }
+    const auto orphan_verification = workspace->verify();
+    check(
+        orphan_verification.has_value() && !orphan_verification.value().valid
+            && orphan_verification.value().orphaned_object_count == 1U,
+        "verification reports an unreferenced object"
+    );
+    const auto cleanup = workspace->cleanup_orphaned_objects();
+    check(
+        cleanup.has_value() && cleanup.value().removed_object_count == 1U
+            && cleanup.value().reclaimed_bytes == 6U,
+        "orphan cleanup reports removed bytes"
+    );
+    check(!std::filesystem::exists(orphan_path), "orphan cleanup removes the unreferenced object");
+    const auto cleaned_verification = workspace->verify();
+    check(
+        cleaned_verification.has_value() && cleaned_verification.value().valid,
+        "workspace verifies after orphan cleanup"
+    );
+
     const auto duplicate_create = SqliteWorkspace::create(workspace_root, pdf_engine);
     check(!duplicate_create.has_value(), "existing workspace cannot be recreated");
     if(!duplicate_create) {
         check(
             duplicate_create.error().code() == ErrorCode::already_exists,
             "existing workspace error is stable"
+        );
+    }
+
+    const auto legacy_root = test_output_root / "legacy-v1";
+    check(create_schema_v1_workspace(legacy_root), "schema v1 migration fixture is created");
+    auto legacy_open = SqliteWorkspace::open(legacy_root, pdf_engine);
+    check(
+        legacy_open.has_value() && legacy_open.value()->info().schema_version == 2U,
+        "schema v1 workspace migrates to schema v2"
+    );
+    if(legacy_open) {
+        auto migrated_workspace = std::move(legacy_open).value();
+        migrated_workspace.reset();
+    }
+    std::vector<std::filesystem::path> migration_backups;
+    const auto backup_root = legacy_root / "backups";
+    if(std::filesystem::exists(backup_root)) {
+        for(const auto& entry : std::filesystem::directory_iterator(backup_root)) {
+            if(entry.is_regular_file()) migration_backups.push_back(entry.path());
+        }
+    }
+    check(migration_backups.size() == 1U, "migration creates exactly one pre-migration backup");
+    if(migration_backups.size() == 1U) {
+        check(
+            database_user_version(migration_backups.front()) == 1,
+            "migration backup preserves the source schema"
         );
     }
 

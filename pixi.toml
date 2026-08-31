@@ -38,3 +38,5 @@ p2-node-import-check = { cmd = "pwsh -NoProfile -File scripts/check-node-imports
 p2-electron-smoke = { cmd = "npm run smoke:electron:p2", depends-on = ["p2-node-import-check", "fixture-verify"] }
 p2-renderer-smoke = { cmd = "npm run smoke:electron:renderer", depends-on = ["p2-node-import-check", "fixture-verify"] }
 p2 = { depends-on = ["toolchain-check", "fixture-verify", "p2-test", "p2-electron-smoke", "p2-renderer-smoke"] }
+workspace = { cmd = "build\\p2-ucrt64\\tools\\reader-workspace.exe", depends-on = ["p2-build"] }
+p3-single-instance-smoke = { cmd = "npm run smoke:electron:single-instance", depends-on = ["p2-node-import-check"] }

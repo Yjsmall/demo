@@ -26,7 +26,12 @@ let nextRequestId = 1;
 const pending = new Map();
 const grantedPaths = new Set();
 const smokeFixture = process.env.CONTEXT_READER_SMOKE_FIXTURE || null;
+const singleInstanceSmoke = process.env.CONTEXT_READER_SINGLE_INSTANCE_SMOKE === '1';
 let smokeRoot = null;
+
+if (singleInstanceSmoke && process.env.CONTEXT_READER_SINGLE_INSTANCE_USER_DATA) {
+  app.setPath('userData', path.resolve(process.env.CONTEXT_READER_SINGLE_INSTANCE_USER_DATA));
+}
 
 function resetReady() {
   ready = new Promise((resolve, reject) => {
@@ -242,7 +247,7 @@ async function createWindow() {
     height: 900,
     minWidth: 960,
     minHeight: 640,
-    show: !smokeFixture,
+    show: !smokeFixture && !singleInstanceSmoke,
     backgroundColor: '#f4f4f5',
     webPreferences: {
       preload: preloadPath,
@@ -259,16 +264,38 @@ async function createWindow() {
   await window.loadFile(rendererPath);
 }
 
-app.isQuitting = false;
-app.whenReady().then(async () => {
-  registerIpc();
-  startUtility();
-  await createWindow();
-});
+function focusMainWindow() {
+  if (!window || window.isDestroyed()) return;
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+}
 
-app.on('before-quit', () => {
-  app.isQuitting = true;
-  child?.kill();
-});
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  if (singleInstanceSmoke) process.stdout.write('single-instance-secondary-exit\n');
+  app.quit();
+} else {
+  app.isQuitting = false;
+  app.on('second-instance', () => {
+    if (singleInstanceSmoke) {
+      process.stdout.write('single-instance-secondary-rejected\n');
+    }
+    focusMainWindow();
+    if (singleInstanceSmoke) process.stdout.write('single-instance-window-focused\n');
+  });
 
-app.on('window-all-closed', () => app.quit());
+  app.whenReady().then(async () => {
+    registerIpc();
+    startUtility();
+    await createWindow();
+    if (singleInstanceSmoke) process.stdout.write('single-instance-primary-ready\n');
+  });
+
+  app.on('before-quit', () => {
+    app.isQuitting = true;
+    child?.kill();
+  });
+
+  app.on('window-all-closed', () => app.quit());
+}

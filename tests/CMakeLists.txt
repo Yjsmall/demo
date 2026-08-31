@@ -55,7 +55,7 @@ endif()
 
 if(CONTEXT_READER_ENABLE_WORKSPACE AND CONTEXT_READER_ENABLE_MUPDF)
     add_executable(sqlite_workspace_test integration/sqlite_workspace_test.cpp)
-    target_link_libraries(sqlite_workspace_test PRIVATE context_reader::core)
+    target_link_libraries(sqlite_workspace_test PRIVATE context_reader::core SQLite::SQLite3)
     target_compile_features(sqlite_workspace_test PRIVATE cxx_std_20)
     target_compile_definitions(
         sqlite_workspace_test
@@ -65,4 +65,18 @@ if(CONTEXT_READER_ENABLE_WORKSPACE AND CONTEXT_READER_ENABLE_MUPDF)
     )
     context_reader_enable_warnings(sqlite_workspace_test)
     add_test(NAME sqlite_workspace_test COMMAND sqlite_workspace_test)
+
+    if(TARGET reader-workspace)
+        find_program(CONTEXT_READER_WORKSPACE_PWSH_EXECUTABLE pwsh REQUIRED)
+        add_test(
+            NAME reader_workspace_cli_test
+            COMMAND
+                "${CONTEXT_READER_WORKSPACE_PWSH_EXECUTABLE}"
+                -NoProfile
+                -File "${CMAKE_SOURCE_DIR}/scripts/check-reader-workspace.ps1"
+                -WorkspaceTool "$<TARGET_FILE:reader-workspace>"
+                -WorkspaceRoot "${CMAKE_BINARY_DIR}/test-output/sqlite-workspace/工作区"
+        )
+        set_tests_properties(reader_workspace_cli_test PROPERTIES DEPENDS sqlite_workspace_test)
+    endif()
 endif()

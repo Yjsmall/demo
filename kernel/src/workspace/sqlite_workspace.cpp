@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
@@ -21,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -33,6 +35,34 @@ namespace context_reader {
 namespace {
 
 constexpr std::uint32_t current_schema_version = 2;
+
+class WorkspaceLock final {
+public:
+    WorkspaceLock() = default;
+    explicit WorkspaceLock(HANDLE handle) noexcept : handle_(handle) {}
+    WorkspaceLock(const WorkspaceLock&) = delete;
+    WorkspaceLock& operator=(const WorkspaceLock&) = delete;
+    WorkspaceLock(WorkspaceLock&& other) noexcept
+        : handle_(std::exchange(other.handle_, INVALID_HANDLE_VALUE)) {}
+    WorkspaceLock& operator=(WorkspaceLock&& other) noexcept {
+        if(this != &other) {
+            close();
+            handle_ = std::exchange(other.handle_, INVALID_HANDLE_VALUE);
+        }
+        return *this;
+    }
+    ~WorkspaceLock() { close(); }
+
+private:
+    void close() noexcept {
+        if(handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+};
 
 class AlgorithmHandle final {
 public:
@@ -129,6 +159,33 @@ private:
 [[nodiscard]] std::string generic_utf8_path(const std::filesystem::path& path) {
     const auto value = path.generic_u8string();
     return std::string(reinterpret_cast<const char*>(value.data()), value.size());
+}
+
+[[nodiscard]] Result<WorkspaceLock> acquire_workspace_lock(
+    const std::filesystem::path& root
+) {
+    const auto lock_path = root / "workspace.lock";
+    const auto handle = CreateFileW(
+        lock_path.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+    if(handle != INVALID_HANDLE_VALUE) {
+        return Result<WorkspaceLock>::success(WorkspaceLock(handle));
+    }
+    const auto error = GetLastError();
+    if(error == ERROR_SHARING_VIOLATION || error == ERROR_LOCK_VIOLATION) {
+        return Result<WorkspaceLock>::failure(
+            Error(ErrorCode::workspace_busy, "Workspace is already open for writing")
+        );
+    }
+    return Result<WorkspaceLock>::failure(
+        Error(ErrorCode::storage_failure, "Workspace lock could not be acquired")
+    );
 }
 
 [[nodiscard]] std::string hex_string(const std::array<std::uint8_t, 32>& bytes) {
@@ -652,6 +709,63 @@ COMMIT;
     );
 }
 
+[[nodiscard]] Result<void> create_migration_backup(
+    sqlite3* source,
+    const std::filesystem::path& root,
+    std::size_t source_version
+) {
+    std::error_code filesystem_error;
+    const auto backup_directory = root / "backups";
+    std::filesystem::create_directories(backup_directory, filesystem_error);
+    if(filesystem_error) {
+        return Result<void>::failure(
+            Error(ErrorCode::storage_failure, "Workspace backup directory could not be created")
+        );
+    }
+
+    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch()
+                           ).count();
+    const auto backup_path = backup_directory /
+                             ("workspace-v" + std::to_string(source_version) + "-" +
+                              std::to_string(timestamp) + ".db");
+    sqlite3* raw_backup = nullptr;
+    const auto backup_path_utf8 = utf8_path(backup_path);
+    if(sqlite3_open_v2(
+           backup_path_utf8.c_str(),
+           &raw_backup,
+           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_EXCLUSIVE | SQLITE_OPEN_FULLMUTEX,
+           nullptr
+       ) != SQLITE_OK) {
+        if(raw_backup != nullptr) sqlite3_close_v2(raw_backup);
+        return Result<void>::failure(
+            Error(ErrorCode::storage_failure, "Workspace migration backup could not be created")
+        );
+    }
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> destination(
+        raw_backup,
+        sqlite3_close_v2
+    );
+    auto* backup = sqlite3_backup_init(destination.get(), "main", source, "main");
+    if(backup == nullptr) {
+        destination.reset();
+        std::filesystem::remove(backup_path, filesystem_error);
+        return Result<void>::failure(
+            Error(ErrorCode::storage_failure, "Workspace migration backup could not be initialized")
+        );
+    }
+    const auto step_result = sqlite3_backup_step(backup, -1);
+    const auto finish_result = sqlite3_backup_finish(backup);
+    if(step_result != SQLITE_DONE || finish_result != SQLITE_OK) {
+        destination.reset();
+        std::filesystem::remove(backup_path, filesystem_error);
+        return Result<void>::failure(
+            Error(ErrorCode::storage_failure, "Workspace migration backup failed")
+        );
+    }
+    return Result<void>::success();
+}
+
 [[nodiscard]] Result<std::size_t> query_count(sqlite3* database, const char* sql) {
     auto statement_result = prepare(database, sql);
     if(!statement_result) {
@@ -678,11 +792,13 @@ class SqliteWorkspace::Impl final {
 public:
     Impl(
         std::filesystem::path root,
+        WorkspaceLock workspace_lock,
         std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> database,
         PdfEngine& pdf_engine,
         WorkspaceInfo info
     ) noexcept
         : root_(std::move(root)),
+          workspace_lock_(std::move(workspace_lock)),
           database_(std::move(database)),
           pdf_engine_(pdf_engine),
           info_(info) {}
@@ -1303,6 +1419,7 @@ public:
             .document_count = 0,
             .document_version_count = 0,
             .referenced_object_count = 0,
+            .orphaned_object_count = 0,
             .issues = {},
         };
 
@@ -1432,11 +1549,107 @@ public:
             );
         }
 
+        auto orphaned_objects = find_orphaned_objects();
+        if(!orphaned_objects) {
+            return Result<WorkspaceVerification>::failure(orphaned_objects.error());
+        }
+        verification.orphaned_object_count = orphaned_objects.value().size();
+        for(const auto& path : orphaned_objects.value()) {
+            verification.issues.emplace_back(
+                "orphaned_document_object:" + generic_utf8_path(path.lexically_relative(root_))
+            );
+        }
+
         verification.valid = verification.issues.empty();
         return Result<WorkspaceVerification>::success(std::move(verification));
     }
 
+    [[nodiscard]] Result<OrphanCleanupResult> cleanup_orphaned_objects() {
+        const std::scoped_lock lock(mutex_);
+        auto orphaned_objects = find_orphaned_objects();
+        if(!orphaned_objects) {
+            return Result<OrphanCleanupResult>::failure(orphaned_objects.error());
+        }
+        OrphanCleanupResult cleanup{.removed_object_count = 0, .reclaimed_bytes = 0};
+        for(const auto& path : orphaned_objects.value()) {
+            std::error_code filesystem_error;
+            const auto size = std::filesystem::file_size(path, filesystem_error);
+            if(filesystem_error || !std::filesystem::remove(path, filesystem_error)
+               || filesystem_error) {
+                return Result<OrphanCleanupResult>::failure(
+                    Error(ErrorCode::storage_failure, "Orphaned PDF object could not be removed")
+                );
+            }
+            ++cleanup.removed_object_count;
+            cleanup.reclaimed_bytes += static_cast<std::uint64_t>(size);
+        }
+        return Result<OrphanCleanupResult>::success(cleanup);
+    }
+
 private:
+    [[nodiscard]] Result<std::unordered_set<std::string>> referenced_object_keys() {
+        auto statement_result = prepare(database_.get(), "SELECT object_key FROM document_versions");
+        if(!statement_result) {
+            return Result<std::unordered_set<std::string>>::failure(statement_result.error());
+        }
+        auto statement = std::move(statement_result).value();
+        std::unordered_set<std::string> keys;
+        int step_result = SQLITE_ROW;
+        while((step_result = sqlite3_step(statement.get())) == SQLITE_ROW) {
+            const auto* key = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 0));
+            if(key == nullptr) {
+                return Result<std::unordered_set<std::string>>::failure(
+                    Error(ErrorCode::storage_failure, "SQLite object key is invalid")
+                );
+            }
+            keys.emplace(generic_utf8_path(std::filesystem::path(key).lexically_normal()));
+        }
+        if(step_result != SQLITE_DONE) {
+            return Result<std::unordered_set<std::string>>::failure(
+                Error(ErrorCode::storage_failure, "Referenced PDF objects could not be listed")
+            );
+        }
+        return Result<std::unordered_set<std::string>>::success(std::move(keys));
+    }
+
+    [[nodiscard]] Result<std::vector<std::filesystem::path>> find_orphaned_objects() {
+        auto referenced = referenced_object_keys();
+        if(!referenced) {
+            return Result<std::vector<std::filesystem::path>>::failure(referenced.error());
+        }
+        const auto object_root = root_ / "objects" / "pdf";
+        std::error_code filesystem_error;
+        if(!std::filesystem::exists(object_root, filesystem_error)) {
+            if(filesystem_error) {
+                return Result<std::vector<std::filesystem::path>>::failure(
+                    Error(ErrorCode::storage_failure, "PDF object directory could not be inspected")
+                );
+            }
+            return Result<std::vector<std::filesystem::path>>::success({});
+        }
+
+        std::vector<std::filesystem::path> orphaned;
+        std::filesystem::recursive_directory_iterator iterator(object_root, filesystem_error);
+        const std::filesystem::recursive_directory_iterator end;
+        while(!filesystem_error && iterator != end) {
+            const auto path = iterator->path();
+            if(iterator->is_regular_file(filesystem_error)) {
+                const auto key = generic_utf8_path(path.lexically_relative(root_).lexically_normal());
+                if(!referenced.value().contains(key)) {
+                    orphaned.push_back(path);
+                }
+            }
+            iterator.increment(filesystem_error);
+        }
+        if(filesystem_error) {
+            return Result<std::vector<std::filesystem::path>>::failure(
+                Error(ErrorCode::storage_failure, "PDF object directory could not be inspected")
+            );
+        }
+        std::sort(orphaned.begin(), orphaned.end());
+        return Result<std::vector<std::filesystem::path>>::success(std::move(orphaned));
+    }
+
     [[nodiscard]] Result<std::optional<DocumentRecord>> find_by_hash(std::string_view hash) {
         auto statement_result = prepare(
             database_.get(),
@@ -1473,6 +1686,7 @@ private:
     }
 
     std::filesystem::path root_;
+    WorkspaceLock workspace_lock_;
     std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> database_;
     PdfEngine& pdf_engine_;
     WorkspaceInfo info_;
@@ -1522,6 +1736,17 @@ Result<std::unique_ptr<SqliteWorkspace>> SqliteWorkspace::create(
         }
     }
 
+    auto lock_result = acquire_workspace_lock(absolute_root);
+    if(!lock_result) {
+        return Result<std::unique_ptr<SqliteWorkspace>>::failure(lock_result.error());
+    }
+    auto workspace_lock = std::move(lock_result).value();
+    if(std::filesystem::exists(database_path, filesystem_error)) {
+        return Result<std::unique_ptr<SqliteWorkspace>>::failure(
+            Error(ErrorCode::already_exists, "Workspace database already exists")
+        );
+    }
+
     auto database_result = open_database(database_path, true);
     if(!database_result) {
         return Result<std::unique_ptr<SqliteWorkspace>>::failure(database_result.error());
@@ -1543,6 +1768,7 @@ Result<std::unique_ptr<SqliteWorkspace>> SqliteWorkspace::create(
     return Result<std::unique_ptr<SqliteWorkspace>>::success(
         std::unique_ptr<SqliteWorkspace>(new SqliteWorkspace(std::make_unique<Impl>(
             absolute_root,
+            std::move(workspace_lock),
             std::move(database),
             pdf_engine,
             info_result.value()
@@ -1568,6 +1794,12 @@ Result<std::unique_ptr<SqliteWorkspace>> SqliteWorkspace::open(
         );
     }
 
+    auto lock_result = acquire_workspace_lock(absolute_root);
+    if(!lock_result) {
+        return Result<std::unique_ptr<SqliteWorkspace>>::failure(lock_result.error());
+    }
+    auto workspace_lock = std::move(lock_result).value();
+
     auto database_result = open_database(database_path, false);
     if(!database_result) {
         return Result<std::unique_ptr<SqliteWorkspace>>::failure(database_result.error());
@@ -1576,6 +1808,20 @@ Result<std::unique_ptr<SqliteWorkspace>> SqliteWorkspace::open(
     auto configuration = configure_database(database.get());
     if(!configuration) {
         return Result<std::unique_ptr<SqliteWorkspace>>::failure(configuration.error());
+    }
+    auto version_result = query_count(database.get(), "PRAGMA user_version");
+    if(!version_result) {
+        return Result<std::unique_ptr<SqliteWorkspace>>::failure(version_result.error());
+    }
+    if(version_result.value() < current_schema_version) {
+        auto backup_result = create_migration_backup(
+            database.get(),
+            absolute_root,
+            version_result.value()
+        );
+        if(!backup_result) {
+            return Result<std::unique_ptr<SqliteWorkspace>>::failure(backup_result.error());
+        }
     }
     auto migration = migrate_database(database.get());
     if(!migration) {
@@ -1589,11 +1835,86 @@ Result<std::unique_ptr<SqliteWorkspace>> SqliteWorkspace::open(
     return Result<std::unique_ptr<SqliteWorkspace>>::success(
         std::unique_ptr<SqliteWorkspace>(new SqliteWorkspace(std::make_unique<Impl>(
             absolute_root,
+            std::move(workspace_lock),
             std::move(database),
             pdf_engine,
             info_result.value()
         )))
     );
+}
+
+Result<WorkspaceInspection> SqliteWorkspace::inspect(const std::filesystem::path& root) {
+    if(root.empty()) {
+        return Result<WorkspaceInspection>::failure(
+            Error(ErrorCode::invalid_argument, "Workspace path is empty")
+        );
+    }
+    std::error_code filesystem_error;
+    const auto absolute_root = std::filesystem::absolute(root, filesystem_error);
+    const auto database_path = absolute_root / "workspace.db";
+    if(filesystem_error || !std::filesystem::is_regular_file(database_path, filesystem_error)) {
+        return Result<WorkspaceInspection>::failure(
+            Error(ErrorCode::not_found, "Workspace database was not found")
+        );
+    }
+    auto lock_result = acquire_workspace_lock(absolute_root);
+    if(!lock_result) {
+        return Result<WorkspaceInspection>::failure(lock_result.error());
+    }
+
+    sqlite3* raw_database = nullptr;
+    const auto path = utf8_path(database_path);
+    if(sqlite3_open_v2(
+           path.c_str(),
+           &raw_database,
+           SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+           nullptr
+       ) != SQLITE_OK) {
+        if(raw_database != nullptr) sqlite3_close_v2(raw_database);
+        return Result<WorkspaceInspection>::failure(
+            Error(ErrorCode::storage_failure, "Workspace database could not be inspected")
+        );
+    }
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> database(
+        raw_database,
+        sqlite3_close_v2
+    );
+    auto version_result = query_count(database.get(), "PRAGMA user_version");
+    if(!version_result || version_result.value() > std::numeric_limits<std::uint32_t>::max()) {
+        return Result<WorkspaceInspection>::failure(
+            version_result ? Error(ErrorCode::storage_failure, "Workspace schema version is invalid")
+                           : version_result.error()
+        );
+    }
+    auto metadata_result = prepare(
+        database.get(),
+        "SELECT workspace_id, schema_version FROM workspace_metadata WHERE singleton = 1"
+    );
+    if(!metadata_result || sqlite3_step(metadata_result.value().get()) != SQLITE_ROW) {
+        return Result<WorkspaceInspection>::failure(
+            Error(ErrorCode::storage_failure, "Workspace metadata is missing")
+        );
+    }
+    auto workspace_id = read_id<WorkspaceId>(metadata_result.value().get(), 0);
+    const auto metadata_version = sqlite3_column_int64(metadata_result.value().get(), 1);
+    if(!workspace_id || metadata_version < 0
+       || static_cast<std::uint64_t>(metadata_version) != version_result.value()) {
+        return Result<WorkspaceInspection>::failure(
+            Error(ErrorCode::storage_failure, "Workspace schema metadata does not match")
+        );
+    }
+    const auto version = static_cast<std::uint32_t>(version_result.value());
+    if(version == 0U || version > current_schema_version) {
+        return Result<WorkspaceInspection>::failure(
+            Error(ErrorCode::unsupported_document, "Workspace schema version is unsupported")
+        );
+    }
+    return Result<WorkspaceInspection>::success(WorkspaceInspection{
+        .id = workspace_id.value(),
+        .schema_version = version,
+        .target_schema_version = current_schema_version,
+        .migration_required = version < current_schema_version,
+    });
 }
 
 WorkspaceInfo SqliteWorkspace::info() const noexcept {
@@ -1641,6 +1962,10 @@ Result<std::vector<NoteRecord>> SqliteWorkspace::list_notes(
 
 Result<WorkspaceVerification> SqliteWorkspace::verify() {
     return implementation_->verify();
+}
+
+Result<OrphanCleanupResult> SqliteWorkspace::cleanup_orphaned_objects() {
+    return implementation_->cleanup_orphaned_objects();
 }
 
 }  // namespace context_reader

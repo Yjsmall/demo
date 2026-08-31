@@ -121,8 +121,11 @@ P0 决策与骨架
 
 ## 7. P3：数据与边界稳定
 
+本地实施状态：进行中。首批已实现 Electron Main 单实例限制、Workspace 独占写入/崩溃释放与稳定 Busy 错误、孤立 PDF 对象验证及显式清理、schema v1 -> v2 迁移前 SQLite 备份，以及遵守同一锁边界的 `reader-workspace inspect/verify/migrate --dry-run`。双 Electron 进程 smoke 已验证第二实例退出且已有窗口收到聚焦通知。Node-API 完整契约、Utility Process 自动重启与陈旧结果隔离、受控 Clock/Seed/Executor 和真实 Replay 尚未完成。
+
 交付内容：
 
+- Electron Main 使用应用单实例锁；第二次启动只恢复并聚焦已有窗口，不能创建第二套 Utility Process 或打开 Workspace。
 - Workspace 独占写入、崩溃后的锁恢复和明确的 Workspace Busy 行为。
 - 对象文件与 SQLite 的提交协议、孤立对象清理、迁移前备份和恢复测试。
 - Node-API 参数、错误、Job、取消、Buffer 和关闭顺序的契约测试。
@@ -131,6 +134,7 @@ P0 决策与骨架
 
 退出条件：
 
+- 首发桌面宿主不能同时运行两个应用实例；第二次启动不会形成第二个 Workspace 写入者。
 - 导入、自动保存、迁移和关闭的故障注入场景不会产生无法解释的权威数据损坏。
 - Utility Process 异常退出后可由 Main 重启，陈旧结果不会覆盖新 revision。
 - 同一行为套件在 Application Facade 和 Node-API 上语义一致。
