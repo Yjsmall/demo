@@ -1,7 +1,24 @@
 EXPORTS
+    napi_add_env_cleanup_hook
+    napi_create_array_with_length
+    napi_create_async_work
+    napi_create_double
+    napi_create_error
     napi_create_function
     napi_create_object
+    napi_create_promise
     napi_create_string_utf8
     napi_create_uint32
+    napi_delete_async_work
+    napi_get_boolean
+    napi_get_cb_info
+    napi_get_undefined
+    napi_get_value_string_utf8
+    napi_queue_async_work
+    napi_reject_deferred
+    napi_resolve_deferred
+    napi_set_element
     napi_set_named_property
+    napi_throw_type_error
     napi_throw_error
+    napi_typeof

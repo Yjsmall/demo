@@ -28,6 +28,15 @@
         "CONTEXT_READER_ENABLE_MUPDF": "ON",
         "CONTEXT_READER_MUPDF_ROOT": "${sourceDir}/build/mupdf-1.28.3"
       }
+    },
+    {
+      "name": "p2-ucrt64",
+      "displayName": "P2 - Workspace vertical slice",
+      "inherits": "p1-ucrt64",
+      "binaryDir": "${sourceDir}/build/p2-ucrt64",
+      "cacheVariables": {
+        "CONTEXT_READER_ENABLE_WORKSPACE": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -38,6 +47,10 @@
     {
       "name": "p1-ucrt64",
       "configurePreset": "p1-ucrt64"
+    },
+    {
+      "name": "p2-ucrt64",
+      "configurePreset": "p2-ucrt64"
     }
   ],
   "testPresets": [
@@ -51,6 +64,13 @@
     {
       "name": "p1-ucrt64",
       "configurePreset": "p1-ucrt64",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "p2-ucrt64",
+      "configurePreset": "p2-ucrt64",
       "output": {
         "outputOnFailure": true
       }

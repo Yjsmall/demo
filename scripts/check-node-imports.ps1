@@ -1,3 +1,7 @@
+param(
+    [string]$BuildDirectory = 'build/node-ucrt64'
+)
+
 $ErrorActionPreference = 'Stop'
 
 $msysRoot = $env:CONTEXT_READER_MSYS2_ROOT
@@ -6,7 +10,8 @@ if (-not $msysRoot) {
 }
 
 $objdumpPath = Join-Path $msysRoot 'ucrt64\bin\objdump.exe'
-$modulePath = Join-Path $PSScriptRoot '..\build\node-ucrt64\reader_node.node'
+$projectRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
+$modulePath = Join-Path $projectRoot "$BuildDirectory\reader_node.node"
 
 if (-not (Test-Path -LiteralPath $objdumpPath)) {
     throw "objdump was not found: $objdumpPath"

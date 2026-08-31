@@ -1,0 +1,40 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "context_reader/shared/stable_id.hpp"
+
+namespace context_reader {
+
+struct WorkspaceInfo final {
+    WorkspaceId id;
+    std::uint32_t schema_version;
+};
+
+struct DocumentRecord final {
+    DocumentId document_id;
+    DocumentVersionId version_id;
+    std::string title;
+    std::string content_sha256;
+    std::string object_key;
+    std::uint64_t byte_length;
+    std::size_t page_count;
+};
+
+struct ImportDocumentResult final {
+    DocumentRecord document;
+    bool reused_existing;
+};
+
+struct WorkspaceVerification final {
+    bool valid;
+    std::size_t document_count;
+    std::size_t document_version_count;
+    std::size_t referenced_object_count;
+    std::vector<std::string> issues;
+};
+
+}  // namespace context_reader

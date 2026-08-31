@@ -31,7 +31,7 @@ int main() {
         auto runtime = std::move(runtime_result).value();
         const auto info = runtime->application().runtime_info();
         check(info.version == RuntimeVersion{0, 1, 0}, "runtime reports semantic version");
-        check(info.application_api_version == 1U, "runtime reports facade API version");
+        check(info.application_api_version == 2U, "runtime reports facade API version");
     }
 
     const auto failure = Result<int>::failure(Error(ErrorCode::not_found, "missing"));

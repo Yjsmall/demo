@@ -54,7 +54,7 @@ app.whenReady().then(() => {
       && message.processVersions?.electron === expectedElectronVersion
       && message.processVersions?.node === expectedNodeVersion
       && message.runtimeInfo?.version === '0.1.0'
-      && message.runtimeInfo?.applicationApiVersion === 1
+      && message.runtimeInfo?.applicationApiVersion === 2
       && message.runtimeInfo?.bindingNapiVersion === expectedBindingNapiVersion
     ) {
       finish(

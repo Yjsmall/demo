@@ -23,3 +23,13 @@ if(CONTEXT_READER_ENABLE_MUPDF)
     target_link_libraries(reader_core PRIVATE MuPDF::MuPDF)
     target_compile_definitions(reader_core PUBLIC CONTEXT_READER_HAS_MUPDF=1)
 endif()
+
+if(CONTEXT_READER_ENABLE_WORKSPACE)
+    target_sources(
+        reader_core
+        PRIVATE
+            src/workspace/sqlite_workspace.cpp
+    )
+    target_link_libraries(reader_core PRIVATE SQLite::SQLite3 bcrypt)
+    target_compile_definitions(reader_core PUBLIC CONTEXT_READER_HAS_WORKSPACE=1)
+endif()

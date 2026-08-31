@@ -30,3 +30,10 @@ p1-build = { cmd = "cmake --build --preset p1-ucrt64", depends-on = ["p1-configu
 p1-test = { cmd = "ctest --preset p1-ucrt64", depends-on = ["p1-build"] }
 probe = { cmd = "build\\p1-ucrt64\\tools\\reader-probe.exe", depends-on = ["p1-build"] }
 p1 = { depends-on = ["toolchain-check", "fixture-verify", "p1-test"] }
+p2-configure = { cmd = "cmake --fresh --preset p2-ucrt64", depends-on = ["mupdf-prepare"] }
+p2-build = { cmd = "cmake --build --preset p2-ucrt64", depends-on = ["p2-configure"] }
+p2-test = { cmd = "ctest --preset p2-ucrt64", depends-on = ["p2-build"] }
+p2-node-build = { cmd = "npm run native:build:p2", depends-on = ["node-install", "mupdf-prepare"] }
+p2-node-import-check = { cmd = "pwsh -NoProfile -File scripts/check-node-imports.ps1 -BuildDirectory build/node-p2-ucrt64", depends-on = ["p2-node-build"] }
+p2-electron-smoke = { cmd = "npm run smoke:electron:p2", depends-on = ["p2-node-import-check", "fixture-verify"] }
+p2 = { depends-on = ["toolchain-check", "fixture-verify", "p2-test", "p2-electron-smoke"] }
