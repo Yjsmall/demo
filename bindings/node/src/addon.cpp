@@ -8,12 +8,14 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
+#include <unordered_map>
 
 #include "context_reader/runtime/reader_runtime.hpp"
 
@@ -42,7 +44,48 @@ enum class Operation {
 
 struct RuntimeState final {
     explicit RuntimeState(std::unique_ptr<ReaderRuntime> value) : runtime(std::move(value)) {}
+
+    struct Job final {
+        CancellationSource cancellation;
+        napi_env environment = nullptr;
+        napi_async_work work = nullptr;
+    };
+
+    [[nodiscard]] bool register_job(
+        const std::string& id,
+        const CancellationSource& cancellation,
+        napi_env environment,
+        napi_async_work work
+    ) {
+        const std::scoped_lock lock(jobs_mutex);
+        return jobs.emplace(
+            id,
+            Job{.cancellation = cancellation, .environment = environment, .work = work}
+        ).second;
+    }
+
+    [[nodiscard]] bool cancel_job(const std::string& id) {
+        const std::scoped_lock lock(jobs_mutex);
+        const auto found = jobs.find(id);
+        if(found == jobs.end()) return false;
+        found->second.cancellation.request_cancellation();
+        if(found->second.work != nullptr) {
+            static_cast<void>(napi_cancel_async_work(
+                found->second.environment,
+                found->second.work
+            ));
+        }
+        return true;
+    }
+
+    void finish_job(const std::string& id) {
+        const std::scoped_lock lock(jobs_mutex);
+        jobs.erase(id);
+    }
+
     std::unique_ptr<ReaderRuntime> runtime;
+    std::mutex jobs_mutex;
+    std::unordered_map<std::string, Job> jobs;
 };
 
 struct AddonContext;
@@ -105,6 +148,8 @@ struct AsyncWork final {
     std::optional<UpdateNote> note;
     std::size_t page_index = 0;
     double pixels_per_point = 1.0;
+    CancellationToken cancellation;
+    std::optional<std::string> job_id;
     Payload payload;
     std::optional<Error> error;
 };
@@ -427,15 +472,24 @@ void execute(napi_env, void* data) {
             case Operation::create_workspace: store(app.create_workspace(work.path), work); break;
             case Operation::open_workspace: store(app.open_workspace(work.path), work); break;
             case Operation::close_workspace: store(app.close_workspace(), work); break;
-            case Operation::import_document: store(app.import_document(work.path), work); break;
+            case Operation::import_document:
+                store(app.import_document(work.path, work.cancellation), work);
+                break;
             case Operation::list_documents: store(app.list_documents(), work); break;
             case Operation::open_document:
-                store(app.open_document(*work.document_id), work);
+                store(app.open_document(*work.document_id, work.cancellation), work);
                 break;
             case Operation::close_document: store(app.close_document(), work); break;
             case Operation::page_info: store(app.page_info(work.page_index), work); break;
             case Operation::render_page:
-                store(app.render_page(work.page_index, work.pixels_per_point), work);
+                store(
+                    app.render_page(
+                        work.page_index,
+                        work.pixels_per_point,
+                        work.cancellation
+                    ),
+                    work
+                );
                 break;
             case Operation::extract_page_text:
                 store(app.extract_page_text(work.page_index), work);
@@ -495,6 +549,9 @@ napi_value payload_value(napi_env env, const Payload& payload) {
 
 void complete(napi_env env, napi_status status, void* data) {
     std::unique_ptr<AsyncWork> work(static_cast<AsyncWork*>(data));
+    if(work->job_id) {
+        work->state->finish_job(*work->job_id);
+    }
     if(status != napi_ok && !work->error) {
         work->error = Error(ErrorCode::cancelled, "Native operation was cancelled");
     }
@@ -731,11 +788,11 @@ napi_value schedule(napi_env env, napi_callback_info info) {
         napi_throw_error(env, "NAPI_ARGUMENT_FAILED", "Failed to read arguments");
         return nullptr;
     }
-    if(count > 2U) {
+    if(count > 3U) {
         napi_throw_type_error(env, "INVALID_ARGUMENT", "Too many arguments");
         return nullptr;
     }
-    std::array<napi_value, 2> arguments{};
+    std::array<napi_value, 3> arguments{};
     auto copied_count = count;
     if(napi_get_cb_info(
            env, info, &copied_count, arguments.data(), nullptr, &raw_data
@@ -757,8 +814,7 @@ napi_value schedule(napi_env env, napi_callback_info info) {
     };
     switch(function.operation) {
         case Operation::create_workspace:
-        case Operation::open_workspace:
-        case Operation::import_document: {
+        case Operation::open_workspace: {
             if(!expect_count(1, "Expected one path argument")) {
                 return nullptr;
             }
@@ -769,8 +825,35 @@ napi_value schedule(napi_env env, napi_callback_info info) {
             work->path = utf8_path(*value);
             break;
         }
+        case Operation::import_document: {
+            if(count != 1U && count != 2U) {
+                napi_throw_type_error(
+                    env,
+                    "INVALID_ARGUMENT",
+                    "Expected a path and optional Job ID"
+                );
+                return nullptr;
+            }
+            const auto value = string_argument(env, arguments[0], "Path must be a string");
+            if(!value) return nullptr;
+            work->path = utf8_path(*value);
+            if(count == 2U) {
+                work->job_id = string_argument(
+                    env,
+                    arguments[1],
+                    "Job ID must be a non-empty string"
+                );
+                if(!work->job_id || work->job_id->empty()) return nullptr;
+            }
+            break;
+        }
         case Operation::open_document: {
-            if(!expect_count(1, "Expected one document ID argument")) {
+            if(count != 1U && count != 2U) {
+                napi_throw_type_error(
+                    env,
+                    "INVALID_ARGUMENT",
+                    "Expected a document ID and optional Job ID"
+                );
                 return nullptr;
             }
             const auto value = string_argument(
@@ -787,6 +870,14 @@ napi_value schedule(napi_env env, napi_callback_info info) {
                     "Document ID must contain exactly 32 hexadecimal characters"
                 );
                 return nullptr;
+            }
+            if(count == 2U) {
+                work->job_id = string_argument(
+                    env,
+                    arguments[1],
+                    "Job ID must be a non-empty string"
+                );
+                if(!work->job_id || work->job_id->empty()) return nullptr;
             }
             break;
         }
@@ -844,7 +935,12 @@ napi_value schedule(napi_env env, napi_callback_info info) {
             break;
         }
         case Operation::render_page: {
-            if(!expect_count(2, "Expected page index and pixels-per-point arguments")) {
+            if(count != 2U && count != 3U) {
+                napi_throw_type_error(
+                    env,
+                    "INVALID_ARGUMENT",
+                    "Expected page index, pixels-per-point and optional Job ID"
+                );
                 return nullptr;
             }
             const auto page_index = page_index_argument(env, arguments[0]);
@@ -856,6 +952,14 @@ napi_value schedule(napi_env env, napi_callback_info info) {
             }
             work->page_index = *page_index;
             work->pixels_per_point = *pixels_per_point;
+            if(count == 3U) {
+                work->job_id = string_argument(
+                    env,
+                    arguments[2],
+                    "Job ID must be a non-empty string"
+                );
+                if(!work->job_id || work->job_id->empty()) return nullptr;
+            }
             break;
         }
         case Operation::close_workspace:
@@ -867,22 +971,54 @@ napi_value schedule(napi_env env, napi_callback_info info) {
             }
             break;
     }
+    CancellationSource cancellation_source;
+    work->cancellation = cancellation_source.token();
     napi_value promise = nullptr;
     napi_value resource_name = nullptr;
     if(napi_create_promise(env, &work->deferred, &promise) != napi_ok
        || napi_create_string_utf8(env, "context_reader.operation", NAPI_AUTO_LENGTH, &resource_name) != napi_ok
        || napi_create_async_work(
            env, nullptr, resource_name, execute, complete, work.get(), &work->work
-       ) != napi_ok
-       || napi_queue_async_work(env, work->work) != napi_ok) {
+       ) != napi_ok) {
         if(work->work != nullptr) {
             napi_delete_async_work(env, work->work);
         }
         napi_throw_error(env, "NAPI_ASYNC_FAILED", "Failed to schedule native operation");
         return nullptr;
     }
+    if(work->job_id && !work->state->register_job(
+                           *work->job_id,
+                           cancellation_source,
+                           env,
+                           work->work
+                       )) {
+        napi_delete_async_work(env, work->work);
+        napi_throw_error(env, "CONFLICT", "Job ID is already active");
+        return nullptr;
+    }
+    if(napi_queue_async_work(env, work->work) != napi_ok) {
+        if(work->job_id) work->state->finish_job(*work->job_id);
+        napi_delete_async_work(env, work->work);
+        napi_throw_error(env, "NAPI_ASYNC_FAILED", "Failed to schedule native operation");
+        return nullptr;
+    }
     work.release();
     return promise;
+}
+
+Napi::Value cancel_job(const Napi::CallbackInfo& info) {
+    const auto env = info.Env();
+    if(info.Length() != 1 || !info[0].IsString()) {
+        Napi::TypeError::New(env, "Job ID must be a string").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    const auto id = info[0].As<Napi::String>().Utf8Value();
+    if(id.empty()) {
+        Napi::TypeError::New(env, "Job ID must not be empty").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    const auto& context = *static_cast<AddonContext*>(info.Data());
+    return Napi::Boolean::New(env, context.state->cancel_job(id));
 }
 
 Napi::Value runtime_info(const Napi::CallbackInfo& info) {
@@ -973,6 +1109,10 @@ Napi::Object initialize(Napi::Env env, Napi::Object exports) {
     exports.Set(
         "runtimeInfo",
         Napi::Function::New(env, runtime_info, "runtimeInfo", context.get())
+    );
+    exports.Set(
+        "cancelJob",
+        Napi::Function::New(env, cancel_job, "cancelJob", context.get())
     );
     for(std::size_t index = 0; index < names.size(); ++index) {
         if(!export_function(env, exports, names[index], schedule, &context->functions[index])) {

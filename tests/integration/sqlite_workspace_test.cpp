@@ -8,6 +8,7 @@
 
 #include "context_reader/pdf/mupdf_engine.hpp"
 #include "context_reader/runtime/reader_runtime.hpp"
+#include "context_reader/runtime/cancellation.hpp"
 #include "context_reader/shared/error.hpp"
 #include "context_reader/workspace/sqlite_workspace.hpp"
 
@@ -232,9 +233,31 @@ int main() {
         auto& application = runtime->application();
         const auto facade_create = application.create_workspace(facade_root);
         check(facade_create.has_value(), "facade creates a workspace");
+        CancellationSource cancelled_import;
+        cancelled_import.request_cancellation();
+        const auto cancelled_import_result = application.import_document(
+            source,
+            cancelled_import.token()
+        );
+        check(
+            !cancelled_import_result.has_value()
+                && cancelled_import_result.error().code() == ErrorCode::cancelled,
+            "facade import honors a cancellation token"
+        );
         const auto facade_import = application.import_document(source);
         check(facade_import.has_value(), "facade imports a PDF");
         if(facade_import) {
+            CancellationSource cancelled_open;
+            cancelled_open.request_cancellation();
+            const auto cancelled_open_result = application.open_document(
+                facade_import.value().document.document_id,
+                cancelled_open.token()
+            );
+            check(
+                !cancelled_open_result.has_value()
+                    && cancelled_open_result.error().code() == ErrorCode::cancelled,
+                "facade document open honors a cancellation token"
+            );
             const auto opened_document = application.open_document(
                 facade_import.value().document.document_id
             );
@@ -264,6 +287,18 @@ int main() {
                     "facade render returns PNG bytes"
                 );
             }
+            CancellationSource cancelled_render;
+            cancelled_render.request_cancellation();
+            const auto cancelled_render_result = application.render_page(
+                0U,
+                1.0,
+                cancelled_render.token()
+            );
+            check(
+                !cancelled_render_result.has_value()
+                    && cancelled_render_result.error().code() == ErrorCode::cancelled,
+                "facade render honors a cancellation token"
+            );
             const auto text = application.extract_page_text(0U);
             check(
                 text.has_value()

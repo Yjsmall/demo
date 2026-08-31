@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' blob: data:; style-src 'self'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    >
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Context Reader</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <section class="window-shell">
+      <header class="app-header">
+        <div class="brand-group">
+          <div class="window-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div class="brand">Context Reader</div>
+        </div>
+        <div class="workspace-actions">
+          <button id="create-workspace" class="secondary-button" type="button">新建工作区</button>
+          <button id="open-workspace" class="secondary-button" type="button">打开工作区</button>
+          <button id="import-pdf" class="primary-button" type="button" disabled>导入 PDF</button>
+        </div>
+        <div class="status-region">
+          <div id="status" class="status" role="status">未打开工作区</div>
+          <button id="cancel-job" class="cancel-button" type="button" hidden>取消</button>
+        </div>
+      </header>
+
+      <main class="workspace-shell">
+        <aside class="library-pane" aria-label="文档库">
+          <div class="workspace-identity"><span>WORKSPACE</span><strong>本地文档</strong></div>
+          <div class="pane-heading"><h1>文档</h1><span id="document-count">0</span></div>
+          <div id="document-list" class="document-list"></div>
+          <div class="privacy-note">文档与笔记仅保存在此设备</div>
+        </aside>
+
+        <section class="content-island" aria-label="阅读工作区">
+          <section class="reader-pane" aria-label="PDF 阅读器">
+            <div class="reader-toolbar">
+              <div class="page-controls">
+                <button id="previous-page" class="icon-button" type="button" title="上一页" aria-label="上一页" disabled>&larr;</button>
+                <span id="page-indicator">0 / 0</span>
+                <button id="next-page" class="icon-button" type="button" title="下一页" aria-label="下一页" disabled>&rarr;</button>
+              </div>
+              <div class="annotation-controls">
+                <div class="color-swatches" aria-label="高亮颜色">
+                  <button class="swatch selected" data-color="yellow" type="button" title="黄色高亮" aria-label="黄色高亮"></button>
+                  <button class="swatch" data-color="green" type="button" title="绿色高亮" aria-label="绿色高亮"></button>
+                  <button class="swatch" data-color="blue" type="button" title="蓝色高亮" aria-label="蓝色高亮"></button>
+                  <button class="swatch" data-color="pink" type="button" title="粉色高亮" aria-label="粉色高亮"></button>
+                </div>
+                <button id="highlight-selection" class="toolbar-button" type="button" disabled>高亮</button>
+              </div>
+              <div class="zoom-controls">
+                <button id="zoom-out" class="icon-button" type="button" title="缩小" aria-label="缩小" disabled>&minus;</button>
+                <span id="zoom-value">100%</span>
+                <button id="zoom-in" class="icon-button" type="button" title="放大" aria-label="放大" disabled>+</button>
+              </div>
+            </div>
+            <div id="reader-scroll" class="reader-scroll">
+              <div id="empty-state" class="empty-state">
+                <div class="empty-glyph" aria-hidden="true">&#9633;</div>
+                <strong>打开一份 PDF 开始阅读</strong>
+                <span>文档、高亮和笔记会保存在当前工作区。</span>
+              </div>
+              <div id="page-stage" class="page-stage" hidden>
+                <img id="page-image" alt="PDF 页面">
+                <div id="annotation-layer" class="annotation-layer"></div>
+                <div id="text-layer" class="text-layer"></div>
+              </div>
+            </div>
+          </section>
+
+          <aside class="note-pane" aria-label="语境笔记">
+            <div class="pane-heading note-heading">
+              <div><span>CONTEXT</span><h2>语境笔记</h2></div>
+              <button id="delete-annotation" class="danger-button" type="button" title="删除高亮" disabled>删除</button>
+            </div>
+            <blockquote id="selected-quote">选择一个高亮</blockquote>
+            <label class="note-label" for="note-source">MARKDOWN</label>
+            <textarea id="note-source" aria-label="Markdown 笔记" spellcheck="true" disabled></textarea>
+            <div class="note-footer">
+              <span id="note-revision">revision 0</span>
+              <button id="save-note" class="primary-button" type="button" disabled>保存笔记</button>
+            </div>
+          </aside>
+        </section>
+      </main>
+    </section>
+    <script src="app.js"></script>
+  </body>
+</html>

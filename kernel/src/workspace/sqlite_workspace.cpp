@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -139,7 +140,10 @@ private:
     return output.str();
 }
 
-[[nodiscard]] Result<std::string> sha256_file(const std::filesystem::path& path) {
+[[nodiscard]] Result<std::string> sha256_file(
+    const std::filesystem::path& path,
+    const CancellationToken& cancellation = CancellationToken{}
+) {
     AlgorithmHandle algorithm;
     if(!nt_success(BCryptOpenAlgorithmProvider(
            algorithm.address(),
@@ -191,6 +195,11 @@ private:
     }
     std::array<char, 64 * 1024> buffer{};
     while(input) {
+        if(cancellation.is_cancellation_requested()) {
+            return Result<std::string>::failure(
+                Error(ErrorCode::cancelled, "Document import was cancelled")
+            );
+        }
         input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         const auto bytes_read = input.gcount();
         if(bytes_read > 0 && !nt_success(BCryptHashData(
@@ -222,6 +231,78 @@ private:
         );
     }
     return Result<std::string>::success(hex_string(bytes));
+}
+
+[[nodiscard]] Result<void> copy_file_cancellable(
+    const std::filesystem::path& source,
+    const std::filesystem::path& destination,
+    const CancellationToken& cancellation
+) {
+    auto partial = destination;
+    partial += ".partial";
+    std::error_code filesystem_error;
+    std::filesystem::remove(partial, filesystem_error);
+
+    std::ifstream input(source, std::ios::binary);
+    std::ofstream output(partial, std::ios::binary | std::ios::trunc);
+    if(!input || !output) {
+        std::filesystem::remove(partial, filesystem_error);
+        return Result<void>::failure(
+            Error(ErrorCode::storage_failure, "PDF object could not be stored")
+        );
+    }
+
+    std::array<char, 64 * 1024> buffer{};
+    while(input) {
+        if(cancellation.is_cancellation_requested()) {
+            input.close();
+            output.close();
+            std::filesystem::remove(partial, filesystem_error);
+            return Result<void>::failure(
+                Error(ErrorCode::cancelled, "Document import was cancelled")
+            );
+        }
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto bytes_read = input.gcount();
+        if(bytes_read > 0) {
+            output.write(buffer.data(), bytes_read);
+        }
+    }
+    output.close();
+    if(!input.eof() || !output) {
+        std::filesystem::remove(partial, filesystem_error);
+        return Result<void>::failure(
+            Error(ErrorCode::storage_failure, "PDF object could not be stored")
+        );
+    }
+    if(cancellation.is_cancellation_requested()) {
+        std::filesystem::remove(partial, filesystem_error);
+        return Result<void>::failure(
+            Error(ErrorCode::cancelled, "Document import was cancelled")
+        );
+    }
+
+    std::filesystem::rename(partial, destination, filesystem_error);
+    if(filesystem_error) {
+        std::filesystem::remove(partial, filesystem_error);
+        return Result<void>::failure(
+            Error(ErrorCode::storage_failure, "PDF object could not be stored")
+        );
+    }
+    return Result<void>::success();
+}
+
+void terminate_at_import_fault_point(std::string_view point) {
+    std::array<char, 64> configured{};
+    const auto length = GetEnvironmentVariableA(
+        "CONTEXT_READER_TEST_IMPORT_FAULT",
+        configured.data(),
+        static_cast<DWORD>(configured.size())
+    );
+    if(length > 0 && length < configured.size()
+       && std::string_view(configured.data(), length) == point) {
+        std::_Exit(86);
+    }
 }
 
 [[nodiscard]] Result<void> execute(sqlite3* database, const char* sql) {
@@ -608,8 +689,16 @@ public:
 
     [[nodiscard]] WorkspaceInfo info() const noexcept { return info_; }
 
-    [[nodiscard]] Result<ImportDocumentResult> import_pdf(const std::filesystem::path& source) {
+    [[nodiscard]] Result<ImportDocumentResult> import_pdf(
+        const std::filesystem::path& source,
+        const CancellationToken& cancellation
+    ) {
         const std::scoped_lock lock(mutex_);
+        if(cancellation.is_cancellation_requested()) {
+            return Result<ImportDocumentResult>::failure(
+                Error(ErrorCode::cancelled, "Document import was cancelled")
+            );
+        }
         std::error_code filesystem_error;
         if(!std::filesystem::is_regular_file(source, filesystem_error) || filesystem_error) {
             return Result<ImportDocumentResult>::failure(
@@ -623,9 +712,20 @@ public:
         }
         const auto page_count = document_result.value()->page_count();
 
-        auto hash_result = sha256_file(source);
+        if(cancellation.is_cancellation_requested()) {
+            return Result<ImportDocumentResult>::failure(
+                Error(ErrorCode::cancelled, "Document import was cancelled")
+            );
+        }
+
+        auto hash_result = sha256_file(source, cancellation);
         if(!hash_result) {
             return Result<ImportDocumentResult>::failure(hash_result.error());
+        }
+        if(cancellation.is_cancellation_requested()) {
+            return Result<ImportDocumentResult>::failure(
+                Error(ErrorCode::cancelled, "Document import was cancelled")
+            );
         }
         const auto& content_hash = hash_result.value();
         auto existing = find_by_hash(content_hash);
@@ -633,6 +733,11 @@ public:
             return Result<ImportDocumentResult>::failure(existing.error());
         }
         if(existing.value().has_value()) {
+            if(cancellation.is_cancellation_requested()) {
+                return Result<ImportDocumentResult>::failure(
+                    Error(ErrorCode::cancelled, "Document import was cancelled")
+                );
+            }
             return Result<ImportDocumentResult>::success(
                 ImportDocumentResult{.document = std::move(*existing.value()), .reused_existing = true}
             );
@@ -659,19 +764,15 @@ public:
             );
         }
         if(std::filesystem::exists(object_path, filesystem_error)) {
-            auto object_hash = sha256_file(object_path);
+            auto object_hash = sha256_file(object_path, cancellation);
             if(!object_hash || object_hash.value() != content_hash) {
                 return Result<ImportDocumentResult>::failure(
                     Error(ErrorCode::conflict, "Existing PDF object does not match its content key")
                 );
             }
         } else {
-            std::filesystem::copy_file(source, object_path, std::filesystem::copy_options::none, filesystem_error);
-            if(filesystem_error) {
-                return Result<ImportDocumentResult>::failure(
-                    Error(ErrorCode::storage_failure, "PDF object could not be stored")
-                );
-            }
+            auto copy_result = copy_file_cancellable(source, object_path, cancellation);
+            if(!copy_result) return Result<ImportDocumentResult>::failure(copy_result.error());
         }
 
         auto ids_result = create_id_pair(database_.get());
@@ -744,11 +845,18 @@ public:
             );
         }
 
+        if(cancellation.is_cancellation_requested()) {
+            return Result<ImportDocumentResult>::failure(
+                Error(ErrorCode::cancelled, "Document import was cancelled")
+            );
+        }
+        terminate_at_import_fault_point("before-commit");
         auto commit_result = execute(database_.get(), "COMMIT");
         if(!commit_result) {
             return Result<ImportDocumentResult>::failure(commit_result.error());
         }
         transaction.commit();
+        terminate_at_import_fault_point("after-commit");
 
         return Result<ImportDocumentResult>::success(ImportDocumentResult{
             .document = DocumentRecord{
@@ -1492,8 +1600,11 @@ WorkspaceInfo SqliteWorkspace::info() const noexcept {
     return implementation_->info();
 }
 
-Result<ImportDocumentResult> SqliteWorkspace::import_pdf(const std::filesystem::path& source) {
-    return implementation_->import_pdf(source);
+Result<ImportDocumentResult> SqliteWorkspace::import_pdf(
+    const std::filesystem::path& source,
+    const CancellationToken& cancellation
+) {
+    return implementation_->import_pdf(source, cancellation);
 }
 
 Result<std::vector<DocumentRecord>> SqliteWorkspace::list_documents() {

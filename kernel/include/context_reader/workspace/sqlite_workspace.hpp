@@ -6,6 +6,7 @@
 
 #include "context_reader/annotation/annotation.hpp"
 #include "context_reader/pdf/pdf_engine.hpp"
+#include "context_reader/runtime/cancellation.hpp"
 #include "context_reader/shared/result.hpp"
 #include "context_reader/workspace/workspace.hpp"
 
@@ -35,7 +36,8 @@ public:
 
     [[nodiscard]] WorkspaceInfo info() const noexcept;
     [[nodiscard]] Result<ImportDocumentResult> import_pdf(
-        const std::filesystem::path& source
+        const std::filesystem::path& source,
+        const CancellationToken& cancellation = CancellationToken{}
     );
     [[nodiscard]] Result<std::vector<DocumentRecord>> list_documents();
     [[nodiscard]] Result<ResolvedDocumentObject> resolve_document(DocumentId document_id);

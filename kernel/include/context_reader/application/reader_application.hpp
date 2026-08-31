@@ -7,6 +7,7 @@
 
 #include "context_reader/annotation/annotation.hpp"
 #include "context_reader/pdf/pdf_engine.hpp"
+#include "context_reader/runtime/cancellation.hpp"
 #include "context_reader/shared/result.hpp"
 #include "context_reader/workspace/workspace.hpp"
 
@@ -47,15 +48,20 @@ public:
     [[nodiscard]] Result<void> close_workspace();
     [[nodiscard]] Result<WorkspaceInfo> workspace_info() const;
     [[nodiscard]] Result<ImportDocumentResult> import_document(
-        const std::filesystem::path& source
+        const std::filesystem::path& source,
+        const CancellationToken& cancellation = CancellationToken{}
     );
     [[nodiscard]] Result<std::vector<DocumentRecord>> list_documents();
-    [[nodiscard]] Result<DocumentRecord> open_document(DocumentId document_id);
+    [[nodiscard]] Result<DocumentRecord> open_document(
+        DocumentId document_id,
+        const CancellationToken& cancellation = CancellationToken{}
+    );
     [[nodiscard]] Result<void> close_document();
     [[nodiscard]] Result<PageInfo> page_info(std::size_t page_index);
     [[nodiscard]] Result<EncodedPageImage> render_page(
         std::size_t page_index,
-        double pixels_per_point
+        double pixels_per_point,
+        const CancellationToken& cancellation = CancellationToken{}
     );
     [[nodiscard]] Result<PageText> extract_page_text(std::size_t page_index);
     [[nodiscard]] Result<AnnotationRecord> create_annotation(const CreateAnnotation& command);

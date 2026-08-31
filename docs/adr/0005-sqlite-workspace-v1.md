@@ -24,4 +24,5 @@ P2 首次引入需要跨进程重启恢复的权威数据。Workspace 必须保�
 - 重启后的文档通过稳定 DocumentId 解析到活动版本的不可变对象；Application Facade 拥有 DocumentSession 生命周期，Binding 不接触对象路径或 MuPDF 句柄。
 - Electron Renderer 无需也不允许加载原生模块；当前 P2 验证路径在 Utility Process 内调用 `reader_node`。
 - 对象文件先于数据库事务落盘，因此提交前进程终止可能留下未引用对象。P3 必须补充独占锁、孤立对象回收、迁移备份与故障注入；v1 验证当前只检查被引用对象。
-- 当前异步 API 防止 Node 主线程执行数据库与 PDF 工作，但尚未形成可取消 JobHandle；可取消导入、打开与渲染仍是 P2 的未完成退出条件。
+- P2 已为导入、打开与渲染建立带稳定 ID 的可取消 Job：Renderer、Main、Utility Process 与 Node-API 传递同一 Job ID，内核取消令牌在导入哈希/复制、文档会话提交和渲染结果提交边界生效。P3 继续补充完整 Node-API Job 契约、进度、关闭竞态与 Replay。
+- P2 的受控故障测试会在导入事务 `COMMIT` 前后终止独立 Utility Process，并验证重新打开后的文档计数与工作区不变量；孤立对象清理及其他写入/迁移故障矩阵仍属于 P3。

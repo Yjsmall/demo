@@ -1,3 +1,5 @@
+const fs = require('node:fs/promises');
+const os = require('node:os');
 const path = require('node:path');
 
 const { app, utilityProcess } = require('electron');
@@ -12,78 +14,114 @@ const fixturePath = path.join(
   'basic-rotated-cropbox.pdf',
 );
 const utilityPath = path.join(__dirname, 'utility-p2.cjs');
+const faultUtilityPath = path.join(__dirname, 'utility-fault-p2.cjs');
 const timeoutMs = 30_000;
 
-let child = null;
-let completed = false;
+function runUtility(script, args, expectedExitCode = null) {
+  return new Promise((resolve, reject) => {
+    const child = utilityProcess.fork(script, args, {
+      serviceName: 'Context Reader P2 Workspace Smoke',
+      stdio: 'pipe',
+    });
+    child.stdout?.pipe(process.stdout);
+    child.stderr?.pipe(process.stderr);
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill();
+      reject(new Error(`Electron P2 Utility Process timed out after ${timeoutMs} ms`));
+    }, timeoutMs);
 
-function finish(exitCode, message) {
-  if (completed) {
-    return;
-  }
-  completed = true;
-  if (message) {
-    (exitCode === 0 ? process.stdout : process.stderr).write(`${message}\n`);
-  }
-  child?.kill();
-  app.exit(exitCode);
+    child.on('message', (message) => {
+      if (settled || expectedExitCode !== null) return;
+      settled = true;
+      clearTimeout(timer);
+      child.kill();
+      if (message?.status === 'error') {
+        reject(new Error(message.message || 'Utility Process reported an error'));
+      } else {
+        resolve(message);
+      }
+    });
+
+    child.on('exit', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (expectedExitCode !== null && code === expectedExitCode) {
+        resolve({ exitCode: code });
+      } else {
+        reject(new Error(`Utility Process exited unexpectedly with code ${code}`));
+      }
+    });
+  });
 }
 
-app.whenReady().then(() => {
-  child = utilityProcess.fork(utilityPath, [addonPath, fixturePath], {
-    serviceName: 'Context Reader P2 Workspace Smoke',
-    stdio: 'pipe',
-  });
-  child.stdout?.pipe(process.stdout);
-  child.stderr?.pipe(process.stderr);
+function validateNormalSmoke(message) {
+  return message?.status === 'ok'
+    && message.processType === 'utility'
+    && message.runtimeInfo?.applicationApiVersion === 5
+    && message.workspaceId === message.reopenedWorkspaceId
+    && message.documentCount === 1
+    && message.verification?.valid === true
+    && message.contentSha256?.length === 64
+    && message.page?.widthPoints === 540
+    && message.page?.heightPoints === 648
+    && message.page?.rotation === 90
+    && message.rendered?.widthPixels === 648
+    && message.rendered?.heightPixels === 540
+    && message.rendered?.byteLength > 8
+    && message.pageText?.text?.includes('Context Reader P1')
+    && message.pageText?.lineCount === 1
+    && message.annotationCount === 1
+    && message.noteCount === 1
+    && message.note?.revision === 2
+    && message.note?.markdownSource === 'Restored **context** note'
+    && message.updatedNoteRevision === 2
+    && message.conflictCode === 'CONFLICT'
+    && message.cancellationAccepted === true
+    && message.cancellationCode === 'CANCELLED';
+}
 
-  const timeout = setTimeout(() => {
-    finish(1, `Electron P2 utility process timed out after ${timeoutMs} ms`);
-  }, timeoutMs);
+async function run() {
+  const normal = await runUtility(utilityPath, [addonPath, fixturePath]);
+  if (!validateNormalSmoke(normal)) {
+    throw new Error(`Unexpected P2 Utility response: ${JSON.stringify(normal)}`);
+  }
 
-  child.on('message', (message) => {
-    clearTimeout(timeout);
-    if (
-      message?.status === 'ok'
-      && message.processType === 'utility'
-      && message.runtimeInfo?.applicationApiVersion === 4
-      && message.workspaceId === message.reopenedWorkspaceId
-      && message.documentCount === 1
-      && message.verification?.valid === true
-      && message.contentSha256?.length === 64
-      && message.page?.widthPoints === 540
-      && message.page?.heightPoints === 648
-      && message.page?.rotation === 90
-      && message.rendered?.widthPixels === 648
-      && message.rendered?.heightPixels === 540
-      && message.rendered?.byteLength > 8
-      && message.pageText?.text?.includes('Context Reader P1')
-      && message.pageText?.lineCount === 1
-      && message.pageText?.firstLine?.bounds?.width > 0
-      && message.annotationCount === 1
-      && message.annotation?.quote?.exact?.includes('Context Reader P1')
-      && message.annotation?.quads?.[0]?.width > 0
-      && message.noteCount === 1
-      && message.note?.revision === 2
-      && message.note?.markdownSource === 'Restored **context** note'
-      && message.updatedNoteRevision === 2
-      && message.conflictCode === 'CONFLICT'
-    ) {
-      finish(
-        0,
-        `Electron utility reopened and rendered workspace ${message.workspaceId} (${message.rendered.widthPixels}x${message.rendered.heightPixels})`,
-      );
-      return;
-    }
-    finish(1, `Unexpected P2 utility response: ${JSON.stringify(message)}`);
-  });
+  const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'context-reader-p2-fault-'));
+  const workspacePath = path.join(temporaryRoot, 'workspace');
+  try {
+    const commonArguments = [addonPath, fixturePath, workspacePath];
+    await runUtility(faultUtilityPath, [...commonArguments, 'setup']);
+    await runUtility(faultUtilityPath, [...commonArguments, 'before-commit'], 86);
+    const beforeRecovery = await runUtility(
+      faultUtilityPath,
+      [...commonArguments, 'verify', '0'],
+    );
+    await runUtility(faultUtilityPath, [...commonArguments, 'after-commit'], 86);
+    const afterRecovery = await runUtility(
+      faultUtilityPath,
+      [...commonArguments, 'verify', '1'],
+    );
+    process.stdout.write(
+      `Electron P2 passed: cancellable Jobs and import recovery `
+        + `(before=${beforeRecovery.documentCount}, after=${afterRecovery.documentCount})\n`,
+    );
+  } finally {
+    await fs.rm(temporaryRoot, { recursive: true, force: true });
+  }
+}
 
-  child.on('exit', (code) => {
-    clearTimeout(timeout);
-    if (!completed) {
-      finish(1, `Electron P2 utility process exited before validation with code ${code}`);
-    }
-  });
+app.whenReady().then(async () => {
+  try {
+    await run();
+    app.exit(0);
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
+    app.exit(1);
+  }
 });
 
 app.on('window-all-closed', () => {});

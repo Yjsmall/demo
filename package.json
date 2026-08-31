@@ -9,6 +9,8 @@
     "native:build:p2": "cmake-js rebuild --runtime electron --runtime-version 44.0.0 --arch x64 --generator Ninja --out build/node-p2-ucrt64 --CDCMAKE_TOOLCHAIN_FILE=cmake/toolchains/msys2-ucrt64.cmake --CDCONTEXT_READER_BUILD_NODE=ON --CDCONTEXT_READER_BUILD_TESTS=OFF --CDCONTEXT_READER_ENABLE_MUPDF=ON --CDCONTEXT_READER_MUPDF_ROOT=build/mupdf-1.28.3 --CDCONTEXT_READER_ENABLE_WORKSPACE=ON",
     "smoke:electron": "node scripts/run-electron-smoke.cjs",
     "smoke:electron:p2": "node scripts/run-electron-p2-smoke.cjs",
+    "smoke:electron:renderer": "node scripts/run-electron-renderer-smoke.cjs",
+    "start:p2": "electron hosts/electron/src/main-app.cjs",
     "test:p0": "npm run native:build && npm run smoke:electron"
   },
   "devDependencies": {

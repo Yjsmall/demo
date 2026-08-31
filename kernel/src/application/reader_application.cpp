@@ -31,7 +31,7 @@ ReaderApplication::~ReaderApplication() = default;
 RuntimeInfo ReaderApplication::runtime_info() const noexcept {
     return RuntimeInfo{
         .version = RuntimeVersion{.major = 0, .minor = 1, .patch = 0},
-        .application_api_version = 4,
+        .application_api_version = 5,
     };
 }
 
@@ -110,16 +110,22 @@ Result<WorkspaceInfo> ReaderApplication::workspace_info() const {
 }
 
 Result<ImportDocumentResult> ReaderApplication::import_document(
-    const std::filesystem::path& source
+    const std::filesystem::path& source,
+    const CancellationToken& cancellation
 ) {
     const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(cancellation.is_cancellation_requested()) {
+        return Result<ImportDocumentResult>::failure(
+            Error(ErrorCode::cancelled, "Document import was cancelled")
+        );
+    }
     if(implementation_->workspace == nullptr) {
         return Result<ImportDocumentResult>::failure(
             Error(ErrorCode::not_found, "No workspace is open")
         );
     }
-    return implementation_->workspace->import_pdf(source);
+    return implementation_->workspace->import_pdf(source, cancellation);
 #else
     static_cast<void>(source);
     return Result<ImportDocumentResult>::failure(
@@ -144,9 +150,17 @@ Result<std::vector<DocumentRecord>> ReaderApplication::list_documents() {
 #endif
 }
 
-Result<DocumentRecord> ReaderApplication::open_document(DocumentId document_id) {
+Result<DocumentRecord> ReaderApplication::open_document(
+    DocumentId document_id,
+    const CancellationToken& cancellation
+) {
     const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(cancellation.is_cancellation_requested()) {
+        return Result<DocumentRecord>::failure(
+            Error(ErrorCode::cancelled, "Document open was cancelled")
+        );
+    }
     if(implementation_->workspace == nullptr) {
         return Result<DocumentRecord>::failure(Error(ErrorCode::not_found, "No workspace is open"));
     }
@@ -154,9 +168,19 @@ Result<DocumentRecord> ReaderApplication::open_document(DocumentId document_id) 
     if(!resolved) {
         return Result<DocumentRecord>::failure(resolved.error());
     }
+    if(cancellation.is_cancellation_requested()) {
+        return Result<DocumentRecord>::failure(
+            Error(ErrorCode::cancelled, "Document open was cancelled")
+        );
+    }
     auto session = DocumentSession::open(implementation_->pdf_engine, resolved.value().path);
     if(!session) {
         return Result<DocumentRecord>::failure(session.error());
+    }
+    if(cancellation.is_cancellation_requested()) {
+        return Result<DocumentRecord>::failure(
+            Error(ErrorCode::cancelled, "Document open was cancelled")
+        );
     }
     auto record = std::move(resolved).value().document;
     implementation_->document_session = std::move(session).value();
@@ -201,16 +225,28 @@ Result<PageInfo> ReaderApplication::page_info(std::size_t page_index) {
 
 Result<EncodedPageImage> ReaderApplication::render_page(
     std::size_t page_index,
-    double pixels_per_point
+    double pixels_per_point,
+    const CancellationToken& cancellation
 ) {
     const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(cancellation.is_cancellation_requested()) {
+        return Result<EncodedPageImage>::failure(
+            Error(ErrorCode::cancelled, "Page render was cancelled")
+        );
+    }
     if(implementation_->document_session == nullptr) {
         return Result<EncodedPageImage>::failure(
             Error(ErrorCode::not_found, "No document is open")
         );
     }
-    return implementation_->document_session->render_page_png(page_index, pixels_per_point);
+    auto rendered = implementation_->document_session->render_page_png(page_index, pixels_per_point);
+    if(cancellation.is_cancellation_requested()) {
+        return Result<EncodedPageImage>::failure(
+            Error(ErrorCode::cancelled, "Page render was cancelled")
+        );
+    }
+    return rendered;
 #else
     static_cast<void>(page_index);
     static_cast<void>(pixels_per_point);

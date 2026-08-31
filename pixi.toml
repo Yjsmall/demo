@@ -36,4 +36,5 @@ p2-test = { cmd = "ctest --preset p2-ucrt64", depends-on = ["p2-build"] }
 p2-node-build = { cmd = "npm run native:build:p2", depends-on = ["node-install", "mupdf-prepare"] }
 p2-node-import-check = { cmd = "pwsh -NoProfile -File scripts/check-node-imports.ps1 -BuildDirectory build/node-p2-ucrt64", depends-on = ["p2-node-build"] }
 p2-electron-smoke = { cmd = "npm run smoke:electron:p2", depends-on = ["p2-node-import-check", "fixture-verify"] }
-p2 = { depends-on = ["toolchain-check", "fixture-verify", "p2-test", "p2-electron-smoke"] }
+p2-renderer-smoke = { cmd = "npm run smoke:electron:renderer", depends-on = ["p2-node-import-check", "fixture-verify"] }
+p2 = { depends-on = ["toolchain-check", "fixture-verify", "p2-test", "p2-electron-smoke", "p2-renderer-smoke"] }

@@ -6,7 +6,7 @@ Context Reader 是一个以 PDF 语境阅读、文本高亮和 Markdown 笔记�
 
 ## 当前状态
 
-当前仓库已完成 P0 工具链与 P1 PDF 风险验证，正在实现 P2 Electron 纵向闭环。现有 P2 切片包含 SQLite Workspace、内容寻址 PDF 导入、重启恢复、只读不变量检查，以及 Electron Utility Process 到 Application Facade 的异步文档打开、页面渲染、文本提取、Quote Anchor 高亮和 revision 化 Markdown 笔记路径；Renderer 阅读 UI、可取消 Job 和进程终止故障注入尚未完成。
+当前仓库已完成 P0 工具链、P1 PDF 风险验证与 P2 Electron 纵向闭环。P2 包含 SQLite Workspace、内容寻址 PDF 导入、重启恢复、只读不变量检查，以及沙箱化 Electron Renderer 经限定 preload/IPC 到 Utility Process 和 Application Facade 的文档打开、页面渲染、文本选择、Quote Anchor 高亮与 revision 化 Markdown 笔记路径；导入、打开和渲染使用可取消 Job，Utility Process 在导入事务提交前后终止后均能重新打开工作区并通过不变量检查。下一阶段为 P3 数据与边界稳定。
 
 ## 核心决策
 
@@ -45,13 +45,16 @@ pixi install --frozen
 pixi run p0
 pixi run p1
 pixi run p2
+npm run start:p2
 ```
 
 `pixi run p0` 会构建并测试 `reader_core`、重新安装锁定的 npm 依赖、编译 `reader_node`、检查 PE 导入边界，并由 Electron Utility Process 加载原生模块。
 
 `pixi run p1` 会从官方 tag 准备锁定提交的 MuPDF 1.28.3 最小静态构建，验证 Fixture manifest，并运行 PDF Port、坐标、真实 MuPDF Adapter 和 `reader-probe inspect` 契约测试。独立 MSYS2 还需要安装 `make` 和 UCRT64 `pkgconf`；MuPDF 源码及构建产物只保存在忽略的 `build/` 目录。
 
-`pixi run p2` 在 P1 基础上构建 SQLite Workspace 与 P2 `reader_node`，运行持久化/重启集成测试、PE 导入边界检查，并由 Electron Utility Process 实际完成创建、导入、重复导入复用、关闭、重开、页面渲染、文本提取、高亮、revision 冲突检测、笔记恢复和完整性核验。
+`pixi run p2` 在 P1 基础上构建 SQLite Workspace 与 P2 `reader_node`，运行持久化/重启集成测试、PE 导入边界检查，并验证 Utility Process 及沙箱化 Renderer 两条真实 Electron 路径。Utility smoke 还会验证排队 Job 取消，以及导入事务提交前后终止进程后的恢复结果；Renderer smoke 会完成创建、导入、渲染、文本选择、高亮和笔记保存，并在 `build/renderer-p2-smoke.png` 留下非空像素检查通过的截图。
+
+`npm run start:p2` 启动当前 P2 桌面宿主。Renderer 只能使用 preload 暴露的限定 API；工作区和 PDF 路径必须先由 Main 文件对话框授权，原生模块、SQLite、MuPDF 和任意文件系统访问均不暴露给 Renderer。
 
 ```powershell
 pixi run probe inspect tests\corpus\generated\basic-rotated-cropbox.pdf --output build\probe-output

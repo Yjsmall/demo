@@ -31,6 +31,14 @@ async function run() {
     await readerNode.openDocument(documents[0].documentId);
     const page = await readerNode.pageInfo(0);
     const rendered = await readerNode.renderPage(0, 1);
+    const cancelledRenderPromise = readerNode.renderPage(0, 16, 'p2-cancelled-render');
+    const cancellationAccepted = readerNode.cancelJob('p2-cancelled-render');
+    let cancellationCode = null;
+    try {
+      await cancelledRenderPromise;
+    } catch (error) {
+      cancellationCode = error?.code;
+    }
     const pageText = await readerNode.extractPageText(0);
     const annotation = await readerNode.createAnnotation({
       documentVersionId: documents[0].versionId,
@@ -103,6 +111,8 @@ async function run() {
       note: notes[0],
       updatedNoteRevision: updatedNote.revision,
       conflictCode,
+      cancellationAccepted,
+      cancellationCode,
       verification,
     });
   } finally {
