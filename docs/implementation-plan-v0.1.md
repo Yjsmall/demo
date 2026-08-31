@@ -145,7 +145,11 @@ P0 决策与骨架
 交付内容：
 
 - 数学公式预览、图片附件、搜索、导出备份和恢复验证。
-- 当前页、相邻页、缩略图和索引的任务优先级及缓存上限。
+- 将最小 mutex `DocumentSession` 演进为 Runtime 管理的有界命令队列/Actor，明确 MuPDF 对象线程归属、关闭顺序和 Job 响应调度；不改变 Utility Process 隔离边界。
+- 页面 display list、可见 Tile 渲染，以及页面信息、structured text/index、display list 和 Tile 的分层有界缓存。
+- 当前页、相邻页、缩略图和索引的任务优先级；视口/缩放 generation 丢弃与 Tile 边界协作式取消。
+- 字符或等价最小选择单元的 Unicode、范围、方向和 page-space Quad；选择结果不再由 DOM 相交行生成权威 Anchor。
+- 渲染单边尺寸、总像素、Tile、缓存和跨边界 Buffer 的资源预算与稳定超限错误。
 - 固定首发设备/环境上的首屏、滚动、缩放、内存和关闭预算。
 - Electron 安装包、安全配置、依赖许可证清单、符号和诊断产物。
 - Build once per target：测试通过的同一构建产物进入发布，不在发布阶段重新编译。
@@ -153,6 +157,10 @@ P0 决策与骨架
 退出条件：
 
 - 产品范围内的端到端、Fixture、Node 契约、迁移、备份恢复和 benchmark smoke 全部通过。
+- 超大页、极端缩放和整数溢出输入在分配前被拒绝；测试观测到的峰值内存不超过已记录预算。
+- 快速滚动和连续缩放时，旧 generation 不提交帧且能在 Tile 边界停止；关闭带待处理任务的 Runtime 不死锁、不泄漏 Buffer。
+- 部分行、跨行、CJK、多栏、连字、RTL、竖排、旋转和 CropBox 选择具有结构化 Quad/Anchor 回归结果。
+- 阅读热路径不要求整页 PNG 编码或在 Kernel、Node-API、IPC 间进行无预算的重复像素复制。
 - 安装包可在干净的首发环境安装、启动、升级或明确拒绝不兼容版本。
 - 发布产物具有 Build ID，并能找到匹配的符号、依赖版本和测试清单。
 - 已知限制已经进入发布说明，没有依赖未实现宿主或未来服务的关键流程。

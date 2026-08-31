@@ -338,18 +338,26 @@ workspace/
 
 ### 10.1 DocumentSession Actor
 
-每个活动 PDF 由一个 `DocumentSession` 串行管理文档访问、文本布局和 display list 创建。渲染任务通过 Runtime 管理的 Executor 执行。
+每个活动 PDF 由一个 `DocumentSession` 串行管理文档访问、文本布局和 display list 创建。MuPDF context、document 和由其派生的 page/text/display list 对象只能由 Session 所在线程访问，不能靠调用方约定或在多个异步工作线程之间共享裸句柄。
 
 ```text
-DocumentSession
-  document handle
+Application Job
+      │ command + request generation
+      ▼
+DocumentSession queue
+      │ single owner
+      ▼
+MuPDF document
   page metadata cache
-  text layout cache
+  structured text/index cache
   display list cache
-  cancellation state
 ```
 
-MuPDF 上下文、文档和设备的线程规则封装在 MuPdfEngine 内，不能要求上层调用者正确加锁。
+Session 接受 `PageInfo`、`BuildTextIndex`、`BuildDisplayList` 和 `Close` 等有界命令。关闭时先停止接收新命令，取消或完成已接收命令，再在所有任务停止后释放 MuPDF 资源。响应必须回到 Job/Dispatcher，不能要求 Node-API 工作线程同步阻塞等待 Session。
+
+Runtime 拥有 Session 使用的 strand/actor 调度器和栅格化 Executor；不得为每次打开文档或每个 Tile 创建不受控线程。Display list 建立和文档级解析由 Session 串行执行；只有确认输入对象可跨线程只读使用后，Tile 栅格化才可进入受控 Executor。
+
+当前 P1-P3 实现以 `DocumentSession` mutex 完成最小串行化，尚未实现上述队列、缓存和 Actor 关闭协议。它是已验证基线，不是最终并发模型；演进时保留现有 `PdfEngine` Port、稳定错误码、Fixture 和 Utility Process 隔离。
 
 ### 10.2 页面分层
 
@@ -378,7 +386,25 @@ PDF 位图层
 document_version + page + scale_bucket + tile + DPR + render_options
 ```
 
-所有长任务必须支持取消。超出视口或缩放版本已过期的渲染结果应被丢弃。
+缓存只保存可重建派生数据，并必须同时定义字节预算、条目预算（适用时）、淘汰策略和 key version。页面信息可按文档缓存；structured text/index 和 display list 采用受限热点页缓存；Tile 位图采用按字节计费的 LRU 或等价有界策略。不得使用仅限制条目数但忽略实际像素字节数的缓存。
+
+每次视口、页码、缩放或 render options 变化都产生单调递增的 request generation。任务在排队、取得 display list、每个 Tile 前后和提交结果前检查 generation；过期任务停止继续生产 Tile，已完成的过期结果不得覆盖当前帧。generation 丢弃解决结果新鲜度，不替代用户取消和 Runtime 关闭协议。
+
+所有长任务必须支持协作式取消。取消至少能够阻止尚未开始的工作，并在 MuPDF 可观察的安全检查点或 Tile 边界尽快停止；只在整页渲染完成后检查 token 不视为执行中取消。
+
+### 10.4 资源预算与数据面
+
+PDF 是不可信输入。缩放上限不能代替输出预算；每次渲染在分配前必须校验有限正数、单边像素上限、总像素上限、单 Tile 字节数和运算溢出。Session、文档缓存、全局渲染缓存和跨边界 Buffer 分别具有明确预算，超限返回稳定的 `INVALID_ARGUMENT` 或 `RESOURCE_EXHAUSTED`，不能依赖分配器终止进程。
+
+产品阅读路径以 display list + 可见 Tile 为主，整页 PNG 只用于 Probe、缩略图或经预算验证的小页面。Kernel 数据面返回项目拥有的像素/Tile Buffer 和几何 DTO，不把 PNG、Electron NativeImage、DOM 或平台 Surface 规定为 PdfEngine 的唯一内部表示。Node-API 优先零拷贝或单次所有权转移；是否引入共享内存仍由基准数据决定。
+
+Utility Process 继续作为不可信 PDF 的进程隔离边界。资源预算用于避免可预防的内存峰值，Utility 重启用于处理不可恢复的原生崩溃；两者不能互相替代。
+
+### 10.5 Structured Text 与选择
+
+文本布局缓存保存字符或等价最小选择单元的 Unicode、阅读顺序、字符范围、方向和 PDF page-space Quad。行矩形可以作为派生的展示/诊断数据，但不能作为精确文本选择和高亮 Anchor 的唯一几何来源。
+
+选择由 PdfModule 根据 page-space 起止点和 structured text index 计算，返回规范化文本、字符范围和逐行/逐片段 Quad。Renderer 只负责把屏幕坐标转换为 page-space 并展示结果，不得通过 DOM 相交行反推权威 Anchor。实现必须覆盖部分行、跨行、CJK、多栏、连字、RTL、竖排、旋转和 CropBox；持久化仍使用项目定义的规范页面坐标，不保存屏幕像素。
 
 ## 11. Application Facade
 

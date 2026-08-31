@@ -296,7 +296,9 @@ Internal
 
 ### 9.2 DocumentSession Actor
 
-MuPDF 文档句柄由 DocumentSession 单独拥有。外部通过消息或序列化队列请求操作，不共享裸 document 指针。
+MuPDF 文档句柄由 DocumentSession 单独拥有。外部通过消息或序列化队列请求操作，不共享裸 document 指针。Session 命令必须有明确的输入、响应、取消和关闭语义；Actor 不得通过持有 Application 全局锁来模拟队列，也不得让 Binding 自行决定 MuPDF 的线程安全规则。
+
+页面信息、structured text index 和 display list 属于 Session 派生缓存。缓存对象的线程归属必须由类型或封装表达；只有经过 MuPDF 线程规则验证的不可变对象才能交给 Runtime Executor 栅格化。Actor、Runtime 线程池和宿主异步队列必须各自职责单一，避免形成多层同步等待。
 
 ### 9.3 长任务
 
@@ -450,8 +452,11 @@ void rk_runtime_destroy(rk_runtime* runtime);
 - 先测量，再优化。
 - 热路径避免重复分配、字符串转换和像素复制。
 - 控制面代码优先可读性，不为微小调用开销牺牲领域模型。
-- 页面使用 Tile 和可取消任务，避免无上限整页缓冲。
-- Cache 必须有明确上限、淘汰策略和 key version。
+- 页面使用 display list + 可见 Tile 和可取消任务，整页 PNG 不作为默认阅读数据面。
+- 每次像素分配前检查单边尺寸、总像素、字节数和整数溢出；缩放上限不能替代资源预算。
+- Cache 必须有明确的字节上限、淘汰策略和 key version，不能只限制条目数量。
+- 视口和缩放请求携带单调递增 generation；过期结果在提交前丢弃，并在 Tile 边界停止后续工作。
+- structured text 缓存保留字符范围和 page-space Quad；行矩形不能作为精确选择的唯一数据。
 - 优化提交包含基准、设备、PDF 样本和前后结果。
 - 基准产物必须记录 Kernel、MuPDF、构建 ID、平台、文档哈希、命令和随机种子。
 
@@ -491,6 +496,9 @@ AI 生成代码必须遵守与人工代码相同的边界：
 - 事务和 revision 语义是否完整？
 - 错误码是否稳定且不泄露敏感信息？
 - Buffer 和 Job 在成功、失败、取消路径是否都释放？
+- PDF 像素、Tile、缓存和跨边界 Buffer 是否具有按字节计算的上限？
+- 过期 generation 是否可能覆盖当前页面，取消是否只能在整页完成后生效？
+- 文本选择是否来自字符级 page-space 几何，而不是 DOM 行相交结果？
 - 是否覆盖真实回归输入和边界测试？
 - 缺陷是否能够通过 Fixture、Probe 或 Replay 产物稳定重现？
 - 公共契约、迁移或 ADR 是否需要同步更新？
