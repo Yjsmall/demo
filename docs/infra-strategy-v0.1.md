@@ -527,7 +527,7 @@ Nightly 趋势越界
 
 - P1 基线入库前：公共 PDF Fixture 的来源、授权审核和二进制存储方式。
 - P1 比较命令启用前：渲染差异采用结构化几何、像素阈值、感知差异或有限人工诊断的组合。
-- P3 Replay 实现前：Run Manifest 和 Replay schema 采用 JSON Schema 还是代码生成 IDL。
+- P3 Replay 已决定采用 JSON Schema 描述的 JSONL v1；出现第二种语言消费者或需要生成代码时再评估代码生成 IDL。
 - P4 性能门槛启用前：Nightly Benchmark 的固定设备和历史结果存储位置。
 - P4 发布前：Windows x64 的符号归档、崩溃文件和 Build ID 方案；其他 OS 在进入支持矩阵前分别决定。
 - P5 C ABI 实现前：开发构建专用 `PdfDiagnosticApi` 是否确有 FFI 诊断消费者需要通过 C ABI 访问。

@@ -9,6 +9,13 @@ project(
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
+set(
+    CONTEXT_READER_DOWNLOAD_CACHE
+    "${CMAKE_SOURCE_DIR}/build/download-cache"
+    CACHE PATH
+    "Shared cache for verified third-party source archives"
+)
+
 include(ArchitectureChecks)
 include(CompilerWarnings)
 include(Asio)
@@ -89,6 +96,10 @@ endif()
 
 if(TARGET reader-workspace)
     context_reader_assert_target_links_only(reader-workspace reader_core)
+endif()
+
+if(TARGET reader-facade-contract)
+    context_reader_assert_target_links_only(reader-facade-contract reader_core)
 endif()
 
 if(TARGET sqlite_workspace_test)

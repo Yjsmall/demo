@@ -121,7 +121,7 @@ P0 决策与骨架
 
 ## 7. P3：数据与边界稳定
 
-本地实施状态：进行中。首批已实现 Electron Main 单实例限制、Workspace 独占写入/崩溃释放与稳定 Busy 错误、孤立 PDF 对象验证及显式清理、schema v1 -> v2 迁移前 SQLite 备份，以及遵守同一锁边界的 `reader-workspace inspect/verify/migrate --dry-run`。双 Electron 进程 smoke 已验证第二实例退出且已有窗口收到聚焦通知。Node-API 完整契约、Utility Process 自动重启与陈旧结果隔离、受控 Clock/Seed/Executor 和真实 Replay 尚未完成。
+本地实施状态：已完成。Electron Main 使用单实例锁；Workspace 提供独占写入、稳定 Busy 错误、孤立对象恢复和迁移前备份；导入、Note 自动保存和迁移具有提交前后故障验证。Utility Process 由带 generation 的 Main supervisor 自动重启并恢复 Workspace/Document 意图，旧 generation 的请求统一失败且不能命中新请求。Node-API 契约覆盖参数、错误、Job、取消、Buffer 和关闭顺序；Facade 与 Node 的归一化行为由同一脚本比较。`reader-replay` 采用 JSON Schema 描述的 JSONL v1，并通过虚拟 Clock、固定 Seed 和受控 Executor 在真实 Node 异步边界稳定重放取消竞态。`pixi run p3` 是统一机器验收入口。
 
 交付内容：
 

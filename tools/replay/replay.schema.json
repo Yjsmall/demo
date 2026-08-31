@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://context-reader.local/schemas/replay-v1.json",
+  "title": "Context Reader Replay JSONL record",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["kind", "schemaVersion", "seed", "scenario"],
+      "properties": {
+        "kind": { "const": "manifest" },
+        "schemaVersion": { "const": 1 },
+        "seed": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "scenario": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["kind", "at", "operation"],
+      "properties": {
+        "kind": { "const": "step" },
+        "at": { "type": "integer", "minimum": 0 },
+        "operation": {
+          "enum": [
+            "create-workspace",
+            "import-document",
+            "open-document",
+            "start-render",
+            "cancel-job",
+            "expect-job-error",
+            "close-document",
+            "close-workspace"
+          ]
+        },
+        "jobId": { "type": "string", "minLength": 1 },
+        "errorCode": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

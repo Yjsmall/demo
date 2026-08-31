@@ -1,0 +1,9 @@
+{"kind":"manifest","schemaVersion":1,"seed":1337,"scenario":"cancel-render-before-close"}
+{"kind":"step","at":0,"operation":"create-workspace"}
+{"kind":"step","at":10,"operation":"import-document","jobId":"replay-import"}
+{"kind":"step","at":20,"operation":"open-document","jobId":"replay-open"}
+{"kind":"step","at":30,"operation":"start-render","jobId":"replay-render"}
+{"kind":"step","at":31,"operation":"cancel-job","jobId":"replay-render"}
+{"kind":"step","at":32,"operation":"expect-job-error","jobId":"replay-render","errorCode":"CANCELLED"}
+{"kind":"step","at":40,"operation":"close-document"}
+{"kind":"step","at":50,"operation":"close-workspace"}

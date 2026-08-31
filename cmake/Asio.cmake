@@ -11,6 +11,7 @@ FetchContent_Declare(
     URL
         "https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-38-2.tar.gz"
     URL_HASH "SHA256=${CONTEXT_READER_ASIO_SHA256}"
+    DOWNLOAD_DIR "${CONTEXT_READER_DOWNLOAD_CACHE}"
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     SOURCE_SUBDIR context-reader-no-cmake-project
 )

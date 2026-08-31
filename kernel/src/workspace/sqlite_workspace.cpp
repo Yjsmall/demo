@@ -349,17 +349,32 @@ private:
     return Result<void>::success();
 }
 
-void terminate_at_import_fault_point(std::string_view point) {
+[[nodiscard]] bool fault_point_configured(const char* variable, std::string_view point) {
     std::array<char, 64> configured{};
     const auto length = GetEnvironmentVariableA(
-        "CONTEXT_READER_TEST_IMPORT_FAULT",
+        variable,
         configured.data(),
         static_cast<DWORD>(configured.size())
     );
-    if(length > 0 && length < configured.size()
-       && std::string_view(configured.data(), length) == point) {
+    return length > 0 && length < configured.size()
+        && std::string_view(configured.data(), length) == point;
+}
+
+void terminate_at_import_fault_point(std::string_view point) {
+    if(fault_point_configured("CONTEXT_READER_TEST_IMPORT_FAULT", point)) {
         std::_Exit(86);
     }
+}
+
+[[nodiscard]] Result<void> fail_at_fault_point(
+    const char* variable,
+    std::string_view point,
+    std::string_view message
+) {
+    if(fault_point_configured(variable, point)) {
+        return Result<void>::failure(Error(ErrorCode::storage_failure, std::string(message)));
+    }
+    return Result<void>::success();
 }
 
 [[nodiscard]] Result<void> execute(sqlite3* database, const char* sql) {
@@ -1306,6 +1321,13 @@ public:
             return Result<NoteRecord>::failure(Error(ErrorCode::storage_failure, "Note lookup failed"));
         }
 
+        Transaction transaction(database_.get());
+        auto begin_result = execute(database_.get(), "BEGIN IMMEDIATE");
+        if(!begin_result) {
+            return Result<NoteRecord>::failure(begin_result.error());
+        }
+        transaction.begin();
+
         if(sqlite3_column_type(lookup.get(), 0) == SQLITE_NULL) {
             if(command.expected_revision != 0U) {
                 return Result<NoteRecord>::failure(
@@ -1329,6 +1351,21 @@ public:
                     Error(ErrorCode::storage_failure, "Note could not be created")
                 );
             }
+            auto fault = fail_at_fault_point(
+                "CONTEXT_READER_TEST_AUTOSAVE_FAULT",
+                "before-commit",
+                "Injected note autosave failure before commit"
+            );
+            if(!fault) return Result<NoteRecord>::failure(fault.error());
+            auto commit_result = execute(database_.get(), "COMMIT");
+            if(!commit_result) return Result<NoteRecord>::failure(commit_result.error());
+            transaction.commit();
+            fault = fail_at_fault_point(
+                "CONTEXT_READER_TEST_AUTOSAVE_FAULT",
+                "after-commit",
+                "Injected note autosave failure after commit"
+            );
+            if(!fault) return Result<NoteRecord>::failure(fault.error());
             return Result<NoteRecord>::success(NoteRecord{
                 .id = id_result.value(),
                 .annotation_id = command.annotation_id,
@@ -1361,6 +1398,21 @@ public:
                 Error(ErrorCode::conflict, "Note revision does not match")
             );
         }
+        auto fault = fail_at_fault_point(
+            "CONTEXT_READER_TEST_AUTOSAVE_FAULT",
+            "before-commit",
+            "Injected note autosave failure before commit"
+        );
+        if(!fault) return Result<NoteRecord>::failure(fault.error());
+        auto commit_result = execute(database_.get(), "COMMIT");
+        if(!commit_result) return Result<NoteRecord>::failure(commit_result.error());
+        transaction.commit();
+        fault = fail_at_fault_point(
+            "CONTEXT_READER_TEST_AUTOSAVE_FAULT",
+            "after-commit",
+            "Injected note autosave failure after commit"
+        );
+        if(!fault) return Result<NoteRecord>::failure(fault.error());
         return Result<NoteRecord>::success(NoteRecord{
             .id = note_id.value(),
             .annotation_id = command.annotation_id,
@@ -1822,10 +1874,26 @@ Result<std::unique_ptr<SqliteWorkspace>> SqliteWorkspace::open(
         if(!backup_result) {
             return Result<std::unique_ptr<SqliteWorkspace>>::failure(backup_result.error());
         }
+        auto fault = fail_at_fault_point(
+            "CONTEXT_READER_TEST_MIGRATION_FAULT",
+            "after-backup",
+            "Injected workspace migration failure after backup"
+        );
+        if(!fault) {
+            return Result<std::unique_ptr<SqliteWorkspace>>::failure(fault.error());
+        }
     }
     auto migration = migrate_database(database.get());
     if(!migration) {
         return Result<std::unique_ptr<SqliteWorkspace>>::failure(migration.error());
+    }
+    auto migration_fault = fail_at_fault_point(
+        "CONTEXT_READER_TEST_MIGRATION_FAULT",
+        "after-migration",
+        "Injected workspace migration failure after commit"
+    );
+    if(!migration_fault) {
+        return Result<std::unique_ptr<SqliteWorkspace>>::failure(migration_fault.error());
     }
     auto info_result = read_workspace_info(database.get());
     if(!info_result) {

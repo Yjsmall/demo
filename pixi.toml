@@ -18,7 +18,7 @@ toolchain-check = "pwsh -NoProfile -File scripts/check-p0-toolchain.ps1"
 configure = "cmake --fresh --preset dev-ucrt64"
 build = { cmd = "cmake --build --preset dev-ucrt64", depends-on = ["configure"] }
 test = { cmd = "ctest --preset dev-ucrt64", depends-on = ["build"] }
-node-install = "npm ci"
+node-install = "pwsh -NoProfile -File scripts/ensure-node-dependencies.ps1"
 node-build = { cmd = "npm run native:build", depends-on = ["node-install"] }
 node-import-check = { cmd = "pwsh -NoProfile -File scripts/check-node-imports.ps1", depends-on = ["node-build"] }
 electron-smoke = { cmd = "npm run smoke:electron", depends-on = ["node-import-check"] }
@@ -40,3 +40,8 @@ p2-renderer-smoke = { cmd = "npm run smoke:electron:renderer", depends-on = ["p2
 p2 = { depends-on = ["toolchain-check", "fixture-verify", "p2-test", "p2-electron-smoke", "p2-renderer-smoke"] }
 workspace = { cmd = "build\\p2-ucrt64\\tools\\reader-workspace.exe", depends-on = ["p2-build"] }
 p3-single-instance-smoke = { cmd = "npm run smoke:electron:single-instance", depends-on = ["p2-node-import-check"] }
+p3-utility-restart-smoke = { cmd = "npm run smoke:electron:utility-restart", depends-on = ["p2-node-import-check"] }
+p3-node-contract = { cmd = "npm run test:node-contract:p3", depends-on = ["p2-node-import-check"] }
+p3-boundary-contract = { cmd = "pwsh -NoProfile -File scripts/check-boundary-contract.ps1 -FacadeTool build/p2-ucrt64/tools/reader-facade-contract.exe -FixturePath tests/corpus/generated/basic-rotated-cropbox.pdf -OutputRoot build/p3-boundary-contract", depends-on = ["p2-build", "p2-node-import-check"] }
+p3-replay = { cmd = "pwsh -NoProfile -File scripts/check-reader-replay.ps1 -TracePath tests/replay/cancel-render.jsonl -OutputRoot build/p3-replay", depends-on = ["p2-node-import-check"] }
+p3 = { depends-on = ["p2", "p3-single-instance-smoke", "p3-utility-restart-smoke", "p3-node-contract", "p3-boundary-contract", "p3-replay"] }

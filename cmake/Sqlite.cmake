@@ -12,6 +12,7 @@ FetchContent_Declare(
     URL
         "https://sqlite.org/2026/sqlite-amalgamation-${CONTEXT_READER_SQLITE_ARCHIVE_VERSION}.zip"
     URL_HASH "SHA3_256=${CONTEXT_READER_SQLITE_SHA3_256}"
+    DOWNLOAD_DIR "${CONTEXT_READER_DOWNLOAD_CACHE}"
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     SOURCE_SUBDIR context-reader-no-cmake-project
 )

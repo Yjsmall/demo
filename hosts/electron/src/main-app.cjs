@@ -27,7 +27,12 @@ const pending = new Map();
 const grantedPaths = new Set();
 const smokeFixture = process.env.CONTEXT_READER_SMOKE_FIXTURE || null;
 const singleInstanceSmoke = process.env.CONTEXT_READER_SINGLE_INSTANCE_SMOKE === '1';
+const utilityRestartFixture = process.env.CONTEXT_READER_UTILITY_RESTART_FIXTURE || null;
 let smokeRoot = null;
+let utilityGeneration = 0;
+let desiredWorkspacePath = null;
+let desiredDocumentId = null;
+let utilityRestartAllowed = true;
 
 if (singleInstanceSmoke && process.env.CONTEXT_READER_SINGLE_INSTANCE_USER_DATA) {
   app.setPath('userData', path.resolve(process.env.CONTEXT_READER_SINGLE_INSTANCE_USER_DATA));
@@ -40,25 +45,61 @@ function resetReady() {
   });
 }
 
-function rejectPending(error) {
-  for (const request of pending.values()) {
+function rejectPending(error, generation) {
+  for (const [requestId, request] of pending.entries()) {
+    if (request.generation !== generation) continue;
     request.reject(error);
+    pending.delete(requestId);
   }
-  pending.clear();
+}
+
+function sendUtility(target, generation, operation, args, jobId = null) {
+  if (!target || target !== child || generation !== utilityGeneration) {
+    const error = new Error('Reader utility generation is no longer active');
+    error.code = 'UTILITY_EXITED';
+    return Promise.reject(error);
+  }
+  const requestId = nextRequestId;
+  nextRequestId += 1;
+  return new Promise((resolve, reject) => {
+    pending.set(requestId, { resolve, reject, generation });
+    target.postMessage({ kind: 'request', requestId, operation, arguments: args, jobId });
+  });
+}
+
+async function restoreUtilityState(target, generation) {
+  if (!desiredWorkspacePath) return;
+  await sendUtility(target, generation, 'openWorkspace', [desiredWorkspacePath]);
+  if (desiredDocumentId) {
+    await sendUtility(target, generation, 'openDocument', [desiredDocumentId]);
+  }
 }
 
 function startUtility() {
   resetReady();
-  child = utilityProcess.fork(utilityPath, [addonPath], {
+  const generation = utilityGeneration + 1;
+  utilityGeneration = generation;
+  const utility = utilityProcess.fork(utilityPath, [addonPath], {
     serviceName: 'Context Reader Kernel',
     stdio: 'pipe',
   });
-  child.stdout?.pipe(process.stdout);
-  child.stderr?.pipe(process.stderr);
+  child = utility;
+  utility.stdout?.pipe(process.stdout);
+  utility.stderr?.pipe(process.stderr);
 
-  child.on('message', (message) => {
+  utility.on('message', (message) => {
+    if (utility !== child || generation !== utilityGeneration) return;
     if (message?.kind === 'ready') {
-      resolveReady(message.runtimeInfo);
+      restoreUtilityState(utility, generation).then(
+        () => {
+          resolveReady({ ...message.runtimeInfo, utilityGeneration: generation });
+        },
+        (error) => {
+          utilityRestartAllowed = false;
+          rejectReady(error);
+          utility.kill();
+        },
+      );
       return;
     }
     if (message?.kind === 'startup-error') {
@@ -71,7 +112,7 @@ function startUtility() {
       return;
     }
     const request = pending.get(message.requestId);
-    if (!request) {
+    if (!request || request.generation !== generation) {
       return;
     }
     pending.delete(message.requestId);
@@ -84,13 +125,14 @@ function startUtility() {
     }
   });
 
-  child.on('exit', (code) => {
+  utility.on('exit', (code) => {
+    if (utility !== child || generation !== utilityGeneration) return;
     const error = new Error(`Reader utility exited with code ${code}`);
     error.code = 'UTILITY_EXITED';
     rejectReady(error);
-    rejectPending(error);
+    rejectPending(error, generation);
     child = null;
-    if (!app.isQuitting) {
+    if (!app.isQuitting && utilityRestartAllowed) {
       startUtility();
     }
   });
@@ -98,17 +140,75 @@ function startUtility() {
 
 async function requestUtility(operation, args, jobId = null) {
   await ready;
-  if (!child) {
+  const target = child;
+  const generation = utilityGeneration;
+  if (!target) {
     const error = new Error('Reader utility is unavailable');
     error.code = 'UTILITY_UNAVAILABLE';
     throw error;
   }
-  const requestId = nextRequestId;
-  nextRequestId += 1;
-  return new Promise((resolve, reject) => {
-    pending.set(requestId, { resolve, reject });
-    child.postMessage({ kind: 'request', requestId, operation, arguments: args, jobId });
-  });
+  const value = await sendUtility(target, generation, operation, args, jobId);
+  if (operation === 'createWorkspace' || operation === 'openWorkspace') {
+    desiredWorkspacePath = path.resolve(args[0]);
+  } else if (operation === 'closeWorkspace') {
+    desiredWorkspacePath = null;
+    desiredDocumentId = null;
+  } else if (operation === 'openDocument') {
+    desiredDocumentId = args[0];
+  } else if (operation === 'closeDocument') {
+    desiredDocumentId = null;
+  }
+  return value;
+}
+
+async function runUtilityRestartSmoke() {
+  const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'context-reader-utility-restart-'));
+  const workspacePath = path.join(temporaryRoot, 'workspace');
+  try {
+    grantedPaths.add(path.resolve(workspacePath));
+    grantedPaths.add(path.resolve(utilityRestartFixture));
+    await requestUtility('createWorkspace', [workspacePath]);
+    const imported = await requestUtility('importDocument', [utilityRestartFixture], 'restart-import');
+    await requestUtility('openDocument', [imported.document.documentId], 'restart-open');
+
+    const previousGeneration = utilityGeneration;
+    utilityRestartAllowed = true;
+    const interrupted = requestUtility('__testDelay', [30_000]);
+    await new Promise((resolve) => setImmediate(resolve));
+    child.kill();
+    let interruptedCode = null;
+    try {
+      await interrupted;
+    } catch (error) {
+      interruptedCode = error?.code;
+    }
+    while (utilityGeneration === previousGeneration) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const runtime = await ready;
+    const documents = await requestUtility('listDocuments', []);
+    const page = await requestUtility('pageInfo', [0]);
+    const rendered = await requestUtility('renderPage', [0, 1], 'restart-fresh-render');
+    if (interruptedCode !== 'UTILITY_EXITED' || runtime.utilityGeneration <= previousGeneration
+        || documents.length !== 1 || page.rotation !== 90 || !(rendered.png instanceof Uint8Array)
+        || rendered.png.length <= 8) {
+      throw new Error('Utility restart did not restore state or isolate the stale request');
+    }
+    process.stdout.write(
+      `Electron Utility restart smoke passed: generation ${previousGeneration}`
+        + ` -> ${runtime.utilityGeneration}\n`,
+    );
+  } finally {
+    if (desiredDocumentId) {
+      try { await requestUtility('closeDocument', []); } catch {}
+    }
+    if (desiredWorkspacePath) {
+      try { await requestUtility('closeWorkspace', []); } catch {}
+    }
+    desiredDocumentId = null;
+    desiredWorkspacePath = null;
+    await fs.rm(temporaryRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  }
 }
 
 function registerIpc() {
@@ -247,7 +347,7 @@ async function createWindow() {
     height: 900,
     minWidth: 960,
     minHeight: 640,
-    show: !smokeFixture && !singleInstanceSmoke,
+    show: !smokeFixture && !singleInstanceSmoke && !utilityRestartFixture,
     backgroundColor: '#f4f4f5',
     webPreferences: {
       preload: preloadPath,
@@ -290,6 +390,15 @@ if (!hasSingleInstanceLock) {
     startUtility();
     await createWindow();
     if (singleInstanceSmoke) process.stdout.write('single-instance-primary-ready\n');
+    if (utilityRestartFixture) {
+      try {
+        await runUtilityRestartSmoke();
+        app.exit(0);
+      } catch (error) {
+        process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
+        app.exit(1);
+      }
+    }
   });
 
   app.on('before-quit', () => {

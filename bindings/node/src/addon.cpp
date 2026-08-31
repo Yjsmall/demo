@@ -951,6 +951,15 @@ napi_value schedule(napi_env env, napi_callback_info info) {
             if(!page_index || !pixels_per_point) {
                 return nullptr;
             }
+            if(!std::isfinite(*pixels_per_point) || *pixels_per_point <= 0.0
+               || *pixels_per_point > 64.0) {
+                napi_throw_range_error(
+                    env,
+                    "INVALID_ARGUMENT",
+                    "Pixels per point must be finite and in the range (0, 64]"
+                );
+                return nullptr;
+            }
             work->page_index = *page_index;
             work->pixels_per_point = *pixels_per_point;
             if(count == 3U) {
@@ -1010,12 +1019,16 @@ napi_value schedule(napi_env env, napi_callback_info info) {
 Napi::Value cancel_job(const Napi::CallbackInfo& info) {
     const auto env = info.Env();
     if(info.Length() != 1 || !info[0].IsString()) {
-        Napi::TypeError::New(env, "Job ID must be a string").ThrowAsJavaScriptException();
+        auto error = Napi::TypeError::New(env, "Job ID must be a string");
+        error.Set("code", Napi::String::New(env, "INVALID_ARGUMENT"));
+        error.ThrowAsJavaScriptException();
         return env.Undefined();
     }
     const auto id = info[0].As<Napi::String>().Utf8Value();
     if(id.empty()) {
-        Napi::TypeError::New(env, "Job ID must not be empty").ThrowAsJavaScriptException();
+        auto error = Napi::TypeError::New(env, "Job ID must not be empty");
+        error.Set("code", Napi::String::New(env, "INVALID_ARGUMENT"));
+        error.ThrowAsJavaScriptException();
         return env.Undefined();
     }
     const auto& context = *static_cast<AddonContext*>(info.Data());
@@ -1026,8 +1039,9 @@ Napi::Value runtime_info(const Napi::CallbackInfo& info) {
     const auto env = info.Env();
     try {
         if(info.Length() != 0) {
-            Napi::TypeError::New(env, "This operation does not accept arguments")
-                .ThrowAsJavaScriptException();
+            auto error = Napi::TypeError::New(env, "This operation does not accept arguments");
+            error.Set("code", Napi::String::New(env, "INVALID_ARGUMENT"));
+            error.ThrowAsJavaScriptException();
             return env.Undefined();
         }
         const auto& context = *static_cast<AddonContext*>(info.Data());

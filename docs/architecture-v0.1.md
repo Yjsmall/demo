@@ -604,5 +604,5 @@ replay format version
 - P0 已使用独立 MSYS2 UCRT64 GCC 16.2.0 通过目标 Electron 的 `.node` 模块加载测试；ADR-0004 要求 Clang 首选路径维持同一验证。同时确认 Node/Electron 版本策略、MuPDF 开源或商业许可方案，并验证 MuPDF 在 Windows 上的 CMake 编排方式。
 - P1 基线入库前：公共 PDF Fixture 的来源、授权审核和二进制存储方式。
 - P2 持久化实现前：Workspace 锁恢复、对象文件与 SQLite 提交/清理协议、备份一致性语义。
-- P3 Replay 实现前：Run Manifest 和 Replay 首版采用 JSON Schema 还是代码生成 IDL。
+- P3 Replay 首版已采用 JSON Schema 描述的 JSONL v1；出现第二种语言消费者或代码生成需求时再重新评估 IDL。
 - P4 性能门槛启用前：固定 CI 设备或独立基准设备，以及首发环境的性能预算。

@@ -10,6 +10,7 @@ FetchContent_Declare(
     Catch2
     URL "https://github.com/catchorg/Catch2/archive/refs/tags/v3.15.0.tar.gz"
     URL_HASH "SHA256=${CONTEXT_READER_CATCH2_SHA256}"
+    DOWNLOAD_DIR "${CONTEXT_READER_DOWNLOAD_CACHE}"
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(Catch2)

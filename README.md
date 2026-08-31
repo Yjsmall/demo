@@ -6,7 +6,7 @@ Context Reader 是一个以 PDF 语境阅读、文本高亮和 Markdown 笔记�
 
 ## 当前状态
 
-当前仓库已完成 P0 工具链、P1 PDF 风险验证与 P2 Electron 纵向闭环，并已开始 P3 数据与边界稳定。首批 P3 能力包括 Electron Main 单实例限制、Workspace 独占写入与崩溃释放、明确的 `WORKSPACE_BUSY`、孤立 PDF 对象检查/清理、schema v1 -> v2 迁移前 SQLite 备份，以及 `reader-workspace inspect/verify/migrate --dry-run`。Node-API 完整契约、Utility Process 重启竞态和真实 Replay 仍在后续 P3 工作中。
+当前仓库已完成 P0 工具链、P1 PDF 风险验证、P2 Electron 纵向闭环与 P3 数据和边界稳定。P3 已覆盖 Electron 单实例、Workspace 独占写入和崩溃恢复、导入/自动保存/迁移故障矩阵、Utility Process 自动重启及 generation 隔离、完整 Node-API 契约、Facade/Node 行为一致性、`reader-workspace`，以及使用受控 Clock、Seed 和 Executor 的真实取消 Replay。
 
 ## 核心决策
 
@@ -35,6 +35,7 @@ Context Reader 是一个以 PDF 语境阅读、文本高亮和 Markdown 笔记�
 - [ADR-0004：Clang 优先的 UCRT64 工具链](docs/adr/0004-clang-first-ucrt64-toolchain.md)
 - [ADR-0005：SQLite Workspace v1 与内容寻址对象仓库](docs/adr/0005-sqlite-workspace-v1.md)
 - [ADR-0006：Annotation、Quote Anchor 与 Note Workspace v2](docs/adr/0006-annotation-note-workspace-v2.md)
+- [ADR-0007：P3 Utility 恢复、边界契约与 Replay](docs/adr/0007-p3-boundary-recovery-and-replay.md)
 
 ## 开发与验证
 
@@ -45,6 +46,7 @@ pixi install --frozen
 pixi run p0
 pixi run p1
 pixi run p2
+pixi run p3
 npm run start:p2
 pixi run workspace inspect <workspace-path>
 pixi run workspace verify <workspace-path>
@@ -52,17 +54,23 @@ pixi run workspace migrate <workspace-path> --dry-run
 pixi run p3-single-instance-smoke
 ```
 
-`pixi run p0` 会构建并测试 `reader_core`、重新安装锁定的 npm 依赖、编译 `reader_node`、检查 PE 导入边界，并由 Electron Utility Process 加载原生模块。
+`pixi run p0` 会构建并测试 `reader_core`、按 `package-lock.json` 变化安装或复用 npm 依赖、编译 `reader_node`、检查 PE 导入边界，并由 Electron Utility Process 加载原生模块。
+
+日常原生构建使用增量配置和编译；CMake FetchContent 的已校验归档统一缓存在 `build/download-cache`，因此 P0、P2 和 Node 构建不会重复联网下载 Asio 等第三方源码。首次构建、删除 `build/`、修改锁文件或发现 Node 安装不完整时仍会下载或执行 `npm ci`。需要主动清空 Node 构建目录时可运行 `npm run native:rebuild` 或 `npm run native:rebuild:p2`。
 
 `pixi run p1` 会从官方 tag 准备锁定提交的 MuPDF 1.28.3 最小静态构建，验证 Fixture manifest，并运行 PDF Port、坐标、真实 MuPDF Adapter 和 `reader-probe inspect` 契约测试。独立 MSYS2 还需要安装 `make` 和 UCRT64 `pkgconf`；MuPDF 源码及构建产物只保存在忽略的 `build/` 目录。
 
 `pixi run p2` 在 P1 基础上构建 SQLite Workspace 与 P2 `reader_node`，运行持久化/重启集成测试、PE 导入边界检查，并验证 Utility Process 及沙箱化 Renderer 两条真实 Electron 路径。Utility smoke 还会验证排队 Job 取消，以及导入事务提交前后终止进程后的恢复结果；Renderer smoke 会完成创建、导入、渲染、文本选择、高亮和笔记保存，并在 `build/renderer-p2-smoke.png` 留下非空像素检查通过的截图。
+
+`pixi run p3` 包含完整 P2 回归，并验证单实例、Workspace 故障恢复矩阵、Utility Process 重启恢复和陈旧请求隔离、Node-API 参数/错误/Job/取消/Buffer/关闭契约、Facade/Node 行为一致性，以及同一 JSONL Replay 连续两次产生完全相同的取消结果。
 
 `npm run start:p2` 启动当前 P2 桌面宿主。Renderer 只能使用 preload 暴露的限定 API；工作区和 PDF 路径必须先由 Main 文件对话框授权，原生模块、SQLite、MuPDF 和任意文件系统访问均不暴露给 Renderer。
 
 产品不支持同时运行两个 Context Reader 应用实例。Electron Main 启动时取得应用单实例锁；再次启动时，新实例立即退出，并由已有实例恢复和聚焦主窗口。`pixi run p3-single-instance-smoke` 会用隔离的用户数据目录启动两个真实 Electron 进程验证该行为。Kernel 的 `workspace.lock` 是独立的数据安全边界，只用于防御 Utility Process 重启短暂重叠、维护工具与应用冲突或未来其他宿主误用同一 Workspace；它不表示产品支持两个应用并发编辑。
 
 `reader-workspace` 的首个 P3 版本输出单行 JSON。所有命令遵守 Workspace 独占锁；`migrate --dry-run` 只报告当前与目标 schema，不修改数据库。`verify` 会报告 SQLite、引用对象与孤立对象问题；孤立对象清理由 Kernel 显式 API 提供，当前 CLI 不自动删除数据。
+
+`reader-replay` 使用版本化 JSONL 输入，并通过真实 Electron Utility -> Node-API -> Application Facade 路径执行。P3 基线场景使用虚拟 Clock、固定 Seed 和受控 Executor 稳定重放渲染取消与关闭时序；实际事件日志只记录逻辑操作和稳定错误码，不记录用户路径或文档内容。
 
 ```powershell
 pixi run probe inspect tests\corpus\generated\basic-rotated-cropbox.pdf --output build\probe-output

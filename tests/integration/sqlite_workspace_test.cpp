@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include <sqlite3.h>
+#include <windows.h>
 
 #include "context_reader/pdf/mupdf_engine.hpp"
 #include "context_reader/runtime/reader_runtime.hpp"
@@ -286,6 +287,51 @@ int main() {
             && reopened_notes.value().front().markdown_source == "Updated **context** note",
         "latest note revision survives restart"
     );
+    if(annotation) {
+        SetEnvironmentVariableA("CONTEXT_READER_TEST_AUTOSAVE_FAULT", "before-commit");
+        const auto before_autosave = workspace->update_note(UpdateNote{
+            .annotation_id = annotation.value().id,
+            .expected_revision = 2U,
+            .markdown_source = "must roll back",
+        });
+        SetEnvironmentVariableA("CONTEXT_READER_TEST_AUTOSAVE_FAULT", nullptr);
+        check(
+            !before_autosave.has_value()
+                && before_autosave.error().code() == ErrorCode::storage_failure,
+            "autosave failure before commit is reported"
+        );
+        const auto notes_after_rollback = workspace->list_notes(imported.document.version_id);
+        check(
+            notes_after_rollback.has_value() && !notes_after_rollback.value().empty()
+                && notes_after_rollback.value().front().revision == 2U
+                && notes_after_rollback.value().front().markdown_source == "Updated **context** note",
+            "autosave failure before commit rolls back authoritatively"
+        );
+
+        SetEnvironmentVariableA("CONTEXT_READER_TEST_AUTOSAVE_FAULT", "after-commit");
+        const auto after_autosave = workspace->update_note(UpdateNote{
+            .annotation_id = annotation.value().id,
+            .expected_revision = 2U,
+            .markdown_source = "Committed despite reported failure",
+        });
+        SetEnvironmentVariableA("CONTEXT_READER_TEST_AUTOSAVE_FAULT", nullptr);
+        check(
+            !after_autosave.has_value() && after_autosave.error().code() == ErrorCode::storage_failure,
+            "autosave failure after commit is reported"
+        );
+        workspace.reset();
+        auto autosave_reopen = SqliteWorkspace::open(workspace_root, pdf_engine);
+        check(autosave_reopen.has_value(), "workspace reopens after autosave commit ambiguity");
+        if(autosave_reopen) workspace = std::move(autosave_reopen).value();
+        const auto notes_after_commit = workspace->list_notes(imported.document.version_id);
+        check(
+            notes_after_commit.has_value() && !notes_after_commit.value().empty()
+                && notes_after_commit.value().front().revision == 3U
+                && notes_after_commit.value().front().markdown_source
+                    == "Committed despite reported failure",
+            "autosave failure after commit is resolved from authoritative revision"
+        );
+    }
 
     const auto displaced_object = object_path.string() + ".missing";
     std::filesystem::rename(object_path, displaced_object, filesystem_error);
@@ -363,6 +409,43 @@ int main() {
             "migration backup preserves the source schema"
         );
     }
+
+    const auto retry_migration_root = test_output_root / "legacy-v1-retry";
+    check(create_schema_v1_workspace(retry_migration_root), "retry migration fixture is created");
+    SetEnvironmentVariableA("CONTEXT_READER_TEST_MIGRATION_FAULT", "after-backup");
+    const auto failed_before_migration = SqliteWorkspace::open(retry_migration_root, pdf_engine);
+    SetEnvironmentVariableA("CONTEXT_READER_TEST_MIGRATION_FAULT", nullptr);
+    check(
+        !failed_before_migration.has_value()
+            && failed_before_migration.error().code() == ErrorCode::storage_failure
+            && database_user_version(retry_migration_root / "workspace.db") == 1,
+        "migration failure after backup leaves schema v1 authoritative"
+    );
+    auto retried_migration = SqliteWorkspace::open(retry_migration_root, pdf_engine);
+    check(
+        retried_migration.has_value() && retried_migration.value()->info().schema_version == 2U,
+        "migration succeeds when retried after backup failure"
+    );
+    if(retried_migration) retried_migration.value().reset();
+
+    const auto committed_migration_root = test_output_root / "legacy-v1-committed";
+    check(create_schema_v1_workspace(committed_migration_root), "committed migration fixture is created");
+    SetEnvironmentVariableA("CONTEXT_READER_TEST_MIGRATION_FAULT", "after-migration");
+    const auto failed_after_migration = SqliteWorkspace::open(committed_migration_root, pdf_engine);
+    SetEnvironmentVariableA("CONTEXT_READER_TEST_MIGRATION_FAULT", nullptr);
+    check(
+        !failed_after_migration.has_value()
+            && failed_after_migration.error().code() == ErrorCode::storage_failure
+            && database_user_version(committed_migration_root / "workspace.db") == 2,
+        "migration failure after commit leaves schema v2 authoritative"
+    );
+    auto committed_migration_reopen = SqliteWorkspace::open(committed_migration_root, pdf_engine);
+    check(
+        committed_migration_reopen.has_value()
+            && committed_migration_reopen.value()->info().schema_version == 2U,
+        "workspace reopens after committed migration failure"
+    );
+    if(committed_migration_reopen) committed_migration_reopen.value().reset();
 
     const auto facade_root = test_output_root / "facade-workspace";
     auto runtime_result = ReaderRuntime::create();

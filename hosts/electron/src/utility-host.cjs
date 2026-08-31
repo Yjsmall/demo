@@ -35,6 +35,13 @@ try {
       return;
     }
     if (message?.kind !== 'request' || !operations.has(message.operation)) {
+      if (message?.kind === 'request' && message.operation === '__testDelay'
+          && process.env.CONTEXT_READER_UTILITY_RESTART_FIXTURE) {
+        const delay = Number(message.arguments?.[0] ?? 0);
+        setTimeout(() => {
+          send({ kind: 'response', requestId: message.requestId, ok: true, value: delay });
+        }, delay);
+      }
       return;
     }
 
