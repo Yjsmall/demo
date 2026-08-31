@@ -7,6 +7,7 @@
 #include "context_reader/shared/error.hpp"
 
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+#include "context_reader/pdf/document_session.hpp"
 #include "context_reader/pdf/mupdf_engine.hpp"
 #include "context_reader/workspace/sqlite_workspace.hpp"
 #endif
@@ -15,10 +16,11 @@ namespace context_reader {
 
 class ReaderApplication::Impl final {
 public:
-	mutable std::mutex mutex;
+    mutable std::mutex mutex;
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
     MuPdfEngine pdf_engine;
     std::unique_ptr<SqliteWorkspace> workspace;
+    std::unique_ptr<DocumentSession> document_session;
 #endif
 };
 
@@ -29,12 +31,12 @@ ReaderApplication::~ReaderApplication() = default;
 RuntimeInfo ReaderApplication::runtime_info() const noexcept {
     return RuntimeInfo{
         .version = RuntimeVersion{.major = 0, .minor = 1, .patch = 0},
-        .application_api_version = 2,
+        .application_api_version = 3,
     };
 }
 
 Result<WorkspaceInfo> ReaderApplication::create_workspace(const std::filesystem::path& root) {
-	const std::scoped_lock lock(implementation_->mutex);
+    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
     if(implementation_->workspace != nullptr) {
         return Result<WorkspaceInfo>::failure(
@@ -56,7 +58,7 @@ Result<WorkspaceInfo> ReaderApplication::create_workspace(const std::filesystem:
 }
 
 Result<WorkspaceInfo> ReaderApplication::open_workspace(const std::filesystem::path& root) {
-	const std::scoped_lock lock(implementation_->mutex);
+    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
     if(implementation_->workspace != nullptr) {
         return Result<WorkspaceInfo>::failure(
@@ -78,11 +80,12 @@ Result<WorkspaceInfo> ReaderApplication::open_workspace(const std::filesystem::p
 }
 
 Result<void> ReaderApplication::close_workspace() {
-	const std::scoped_lock lock(implementation_->mutex);
+    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
     if(implementation_->workspace == nullptr) {
         return Result<void>::failure(Error(ErrorCode::not_found, "No workspace is open"));
     }
+    implementation_->document_session.reset();
     implementation_->workspace.reset();
     return Result<void>::success();
 #else
@@ -93,7 +96,7 @@ Result<void> ReaderApplication::close_workspace() {
 }
 
 Result<WorkspaceInfo> ReaderApplication::workspace_info() const {
-	const std::scoped_lock lock(implementation_->mutex);
+    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
     if(implementation_->workspace == nullptr) {
         return Result<WorkspaceInfo>::failure(Error(ErrorCode::not_found, "No workspace is open"));
@@ -109,7 +112,7 @@ Result<WorkspaceInfo> ReaderApplication::workspace_info() const {
 Result<ImportDocumentResult> ReaderApplication::import_document(
     const std::filesystem::path& source
 ) {
-	const std::scoped_lock lock(implementation_->mutex);
+    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
     if(implementation_->workspace == nullptr) {
         return Result<ImportDocumentResult>::failure(
@@ -126,7 +129,7 @@ Result<ImportDocumentResult> ReaderApplication::import_document(
 }
 
 Result<std::vector<DocumentRecord>> ReaderApplication::list_documents() {
-	const std::scoped_lock lock(implementation_->mutex);
+    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
     if(implementation_->workspace == nullptr) {
         return Result<std::vector<DocumentRecord>>::failure(
@@ -141,8 +144,99 @@ Result<std::vector<DocumentRecord>> ReaderApplication::list_documents() {
 #endif
 }
 
+Result<DocumentRecord> ReaderApplication::open_document(DocumentId document_id) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->workspace == nullptr) {
+        return Result<DocumentRecord>::failure(Error(ErrorCode::not_found, "No workspace is open"));
+    }
+    auto resolved = implementation_->workspace->resolve_document(document_id);
+    if(!resolved) {
+        return Result<DocumentRecord>::failure(resolved.error());
+    }
+    auto session = DocumentSession::open(implementation_->pdf_engine, resolved.value().path);
+    if(!session) {
+        return Result<DocumentRecord>::failure(session.error());
+    }
+    auto record = std::move(resolved).value().document;
+    implementation_->document_session = std::move(session).value();
+    return Result<DocumentRecord>::success(std::move(record));
+#else
+    static_cast<void>(document_id);
+    return Result<DocumentRecord>::failure(
+        Error(ErrorCode::unsupported_document, "Workspace support is not available")
+    );
+#endif
+}
+
+Result<void> ReaderApplication::close_document() {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->document_session == nullptr) {
+        return Result<void>::failure(Error(ErrorCode::not_found, "No document is open"));
+    }
+    implementation_->document_session.reset();
+    return Result<void>::success();
+#else
+    return Result<void>::failure(
+        Error(ErrorCode::unsupported_document, "Workspace support is not available")
+    );
+#endif
+}
+
+Result<PageInfo> ReaderApplication::page_info(std::size_t page_index) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->document_session == nullptr) {
+        return Result<PageInfo>::failure(Error(ErrorCode::not_found, "No document is open"));
+    }
+    return implementation_->document_session->page_info(page_index);
+#else
+    static_cast<void>(page_index);
+    return Result<PageInfo>::failure(
+        Error(ErrorCode::unsupported_document, "Workspace support is not available")
+    );
+#endif
+}
+
+Result<EncodedPageImage> ReaderApplication::render_page(
+    std::size_t page_index,
+    double pixels_per_point
+) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->document_session == nullptr) {
+        return Result<EncodedPageImage>::failure(
+            Error(ErrorCode::not_found, "No document is open")
+        );
+    }
+    return implementation_->document_session->render_page_png(page_index, pixels_per_point);
+#else
+    static_cast<void>(page_index);
+    static_cast<void>(pixels_per_point);
+    return Result<EncodedPageImage>::failure(
+        Error(ErrorCode::unsupported_document, "Workspace support is not available")
+    );
+#endif
+}
+
+Result<PageText> ReaderApplication::extract_page_text(std::size_t page_index) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->document_session == nullptr) {
+        return Result<PageText>::failure(Error(ErrorCode::not_found, "No document is open"));
+    }
+    return implementation_->document_session->extract_text(page_index);
+#else
+    static_cast<void>(page_index);
+    return Result<PageText>::failure(
+        Error(ErrorCode::unsupported_document, "Workspace support is not available")
+    );
+#endif
+}
+
 Result<WorkspaceVerification> ReaderApplication::verify_workspace() {
-	const std::scoped_lock lock(implementation_->mutex);
+    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
     if(implementation_->workspace == nullptr) {
         return Result<WorkspaceVerification>::failure(

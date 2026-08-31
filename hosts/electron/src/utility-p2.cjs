@@ -23,11 +23,23 @@ async function run() {
       throw new Error('Duplicate import did not reuse the existing document');
     }
 
+    await readerNode.openDocument(imported.document.documentId);
+    await readerNode.closeDocument();
     await readerNode.closeWorkspace();
     const reopened = await readerNode.openWorkspace(workspacePath);
     const documents = await readerNode.listDocuments();
+    await readerNode.openDocument(documents[0].documentId);
+    const page = await readerNode.pageInfo(0);
+    const rendered = await readerNode.renderPage(0, 1);
+    const pageText = await readerNode.extractPageText(0);
     const verification = await readerNode.verifyWorkspace();
+    await readerNode.closeDocument();
     await readerNode.closeWorkspace();
+
+    const expectedPngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    if (!Buffer.isBuffer(rendered.png) || !rendered.png.subarray(0, 8).equals(expectedPngSignature)) {
+      throw new Error('Rendered page did not return a PNG Buffer');
+    }
 
     send({
       status: 'ok',
@@ -37,6 +49,18 @@ async function run() {
       reopenedWorkspaceId: reopened.id,
       documentCount: documents.length,
       contentSha256: documents[0]?.contentSha256,
+      page,
+      rendered: {
+        widthPixels: rendered.widthPixels,
+        heightPixels: rendered.heightPixels,
+        pixelsPerPoint: rendered.pixelsPerPoint,
+        byteLength: rendered.png.length,
+      },
+      pageText: {
+        text: pageText.text,
+        lineCount: pageText.lines.length,
+        firstLine: pageText.lines[0],
+      },
       verification,
     });
   } finally {

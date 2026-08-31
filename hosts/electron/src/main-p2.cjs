@@ -46,15 +46,24 @@ app.whenReady().then(() => {
     if (
       message?.status === 'ok'
       && message.processType === 'utility'
-      && message.runtimeInfo?.applicationApiVersion === 2
+      && message.runtimeInfo?.applicationApiVersion === 3
       && message.workspaceId === message.reopenedWorkspaceId
       && message.documentCount === 1
       && message.verification?.valid === true
       && message.contentSha256?.length === 64
+      && message.page?.widthPoints === 540
+      && message.page?.heightPoints === 648
+      && message.page?.rotation === 90
+      && message.rendered?.widthPixels === 648
+      && message.rendered?.heightPixels === 540
+      && message.rendered?.byteLength > 8
+      && message.pageText?.text?.includes('Context Reader P1')
+      && message.pageText?.lineCount === 1
+      && message.pageText?.firstLine?.bounds?.width > 0
     ) {
       finish(
         0,
-        `Electron utility imported and reopened workspace ${message.workspaceId} (${message.contentSha256})`,
+        `Electron utility reopened and rendered workspace ${message.workspaceId} (${message.rendered.widthPixels}x${message.rendered.heightPixels})`,
       );
       return;
     }

@@ -11,6 +11,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 include(ArchitectureChecks)
 include(CompilerWarnings)
+include(Asio)
 
 option(CONTEXT_READER_BUILD_TESTS "Build Context Reader tests" ON)
 option(CONTEXT_READER_BUILD_NODE "Build the Node-API binding" OFF)
@@ -48,10 +49,11 @@ endif()
 
 if(CONTEXT_READER_BUILD_TESTS)
     include(CTest)
+    include(Catch2)
     add_subdirectory(tests)
 endif()
 
-set(_context_reader_core_allowed_targets)
+set(_context_reader_core_allowed_targets Asio::Asio)
 if(CONTEXT_READER_ENABLE_MUPDF)
     list(APPEND _context_reader_core_allowed_targets MuPDF::MuPDF)
 endif()
@@ -66,7 +68,11 @@ if(TARGET reader_node)
 endif()
 
 if(TARGET reader_core_test)
-    context_reader_assert_target_links_only(reader_core_test reader_core)
+    context_reader_assert_target_links_only(
+        reader_core_test
+        reader_core
+        Catch2::Catch2WithMain
+    )
 endif()
 
 if(TARGET pdf_foundation_test)

@@ -4,6 +4,7 @@ add_library(
         src/application/reader_application.cpp
         src/pdf/document_session.cpp
         src/pdf/page_geometry.cpp
+        src/runtime/runtime_executor.cpp
         src/runtime/reader_runtime.cpp
 )
 
@@ -16,6 +17,7 @@ target_include_directories(
 )
 
 target_compile_features(reader_core PUBLIC cxx_std_20)
+target_link_libraries(reader_core PRIVATE Asio::Asio)
 context_reader_enable_warnings(reader_core)
 
 if(CONTEXT_READER_ENABLE_MUPDF)

@@ -1,52 +1,50 @@
-#include <array>
+#include <atomic>
 #include <cstdint>
-#include <iostream>
-#include <string_view>
+#include <utility>
+
+#include <catch2/catch_test_macros.hpp>
 
 #include "context_reader/runtime/reader_runtime.hpp"
 #include "context_reader/shared/error.hpp"
 #include "context_reader/shared/result.hpp"
 #include "context_reader/shared/stable_id.hpp"
 
-namespace {
+using namespace context_reader;
 
-int failures = 0;
+TEST_CASE("reader runtime reports its API and executes work") {
+    auto runtime_result = ReaderRuntime::create();
+    REQUIRE(runtime_result.has_value());
 
-void check(bool condition, std::string_view message) {
-    if(!condition) {
-        std::cerr << "FAILED: " << message << '\n';
-        ++failures;
-    }
+    auto runtime = std::move(runtime_result).value();
+    const auto info = runtime->application().runtime_info();
+    CHECK(info.version == RuntimeVersion{0, 1, 0});
+    CHECK(info.application_api_version == 3U);
+    CHECK(runtime->executor().concurrency() > 0);
+
+    std::atomic_bool task_ran{false};
+    auto completion_result = runtime->executor().submit([&task_ran] { task_ran = true; });
+    REQUIRE(completion_result.has_value());
+    std::move(completion_result).value().get();
+    CHECK(task_ran.load());
 }
 
-}  // namespace
-
-int main() {
-    using namespace context_reader;
-
-    auto runtime_result = ReaderRuntime::create();
-    check(runtime_result.has_value(), "runtime creation succeeds");
-
-    if(runtime_result) {
-        auto runtime = std::move(runtime_result).value();
-        const auto info = runtime->application().runtime_info();
-        check(info.version == RuntimeVersion{0, 1, 0}, "runtime reports semantic version");
-        check(info.application_api_version == 2U, "runtime reports facade API version");
-    }
-
-    const auto failure = Result<int>::failure(Error(ErrorCode::not_found, "missing"));
-    check(!failure.has_value(), "result preserves failure state");
-    check(failure.error().code() == ErrorCode::not_found, "result preserves error code");
+TEST_CASE("stable IDs parse and compare by value") {
+    const auto parsed_id = stable_id_from_hex<DocumentIdTag>(
+        "00112233445566778899aabbccddeeff"
+    );
+    REQUIRE(parsed_id.has_value());
+    CHECK(stable_id_to_hex(*parsed_id) == "00112233445566778899aabbccddeeff");
+    CHECK_FALSE(stable_id_from_hex<DocumentIdTag>("not-a-document-id").has_value());
 
     DocumentId::Bytes document_bytes{};
     document_bytes.back() = std::uint8_t{1};
     const auto document_id = DocumentId::from_bytes(document_bytes);
-    check(!document_id.is_nil(), "stable ID distinguishes non-nil values");
-    check(document_id == DocumentId::from_bytes(document_bytes), "stable ID equality is value based");
+    CHECK_FALSE(document_id.is_nil());
+    CHECK(document_id == DocumentId::from_bytes(document_bytes));
+}
 
-    if(failures == 0) {
-        std::cout << "reader_core_test passed\n";
-    }
-
-    return failures == 0 ? 0 : 1;
+TEST_CASE("result preserves a structured failure") {
+    const auto failure = Result<int>::failure(Error(ErrorCode::not_found, "missing"));
+    REQUIRE_FALSE(failure.has_value());
+    CHECK(failure.error().code() == ErrorCode::not_found);
 }

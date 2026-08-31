@@ -9,6 +9,11 @@
 
 namespace context_reader {
 
+struct ResolvedDocumentObject final {
+    DocumentRecord document;
+    std::filesystem::path path;
+};
+
 class SqliteWorkspace final {
 public:
     [[nodiscard]] static Result<std::unique_ptr<SqliteWorkspace>> create(
@@ -31,6 +36,7 @@ public:
         const std::filesystem::path& source
     );
     [[nodiscard]] Result<std::vector<DocumentRecord>> list_documents();
+    [[nodiscard]] Result<ResolvedDocumentObject> resolve_document(DocumentId document_id);
     [[nodiscard]] Result<WorkspaceVerification> verify();
 
 private:

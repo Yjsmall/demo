@@ -13,10 +13,29 @@ add_library(
         ${CMAKE_JS_SRC}
 )
 
-target_include_directories(reader_node PRIVATE ${CMAKE_JS_INC})
+set(_context_reader_node_addon_api "${CMAKE_SOURCE_DIR}/node_modules/node-addon-api")
+if(NOT EXISTS "${_context_reader_node_addon_api}/napi.h")
+    message(
+        FATAL_ERROR
+        "node-addon-api is missing; run npm ci before configuring reader_node"
+    )
+endif()
+
+target_include_directories(
+    reader_node
+    SYSTEM PRIVATE
+        ${CMAKE_JS_INC}
+        "${_context_reader_node_addon_api}"
+)
 target_link_libraries(reader_node PRIVATE context_reader::core)
 target_compile_features(reader_node PRIVATE cxx_std_20)
-target_compile_definitions(reader_node PRIVATE NODE_GYP_MODULE_NAME=reader_node NAPI_VERSION=8)
+target_compile_definitions(
+    reader_node
+    PRIVATE
+        NODE_ADDON_API_CPP_EXCEPTIONS
+        NODE_GYP_MODULE_NAME=reader_node
+        NAPI_VERSION=8
+)
 context_reader_enable_warnings(reader_node)
 
 set_target_properties(

@@ -3,6 +3,7 @@
 #include <memory>
 
 #include "context_reader/application/reader_application.hpp"
+#include "context_reader/runtime/runtime_executor.hpp"
 #include "context_reader/shared/result.hpp"
 
 namespace context_reader {
@@ -19,11 +20,14 @@ public:
 
     [[nodiscard]] ReaderApplication& application() noexcept { return application_; }
     [[nodiscard]] const ReaderApplication& application() const noexcept { return application_; }
+    [[nodiscard]] RuntimeExecutor& executor() noexcept { return *executor_; }
+    [[nodiscard]] const RuntimeExecutor& executor() const noexcept { return *executor_; }
 
 private:
-    ReaderRuntime() = default;
+    explicit ReaderRuntime(std::unique_ptr<RuntimeExecutor> executor);
 
     ReaderApplication application_;
+    std::unique_ptr<RuntimeExecutor> executor_;
 };
 
 }  // namespace context_reader

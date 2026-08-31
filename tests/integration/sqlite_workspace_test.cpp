@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -168,6 +171,45 @@ int main() {
         check(facade_create.has_value(), "facade creates a workspace");
         const auto facade_import = application.import_document(source);
         check(facade_import.has_value(), "facade imports a PDF");
+        if(facade_import) {
+            const auto opened_document = application.open_document(
+                facade_import.value().document.document_id
+            );
+            check(opened_document.has_value(), "facade opens an imported document by stable ID");
+            const auto page = application.page_info(0U);
+            check(page.has_value(), "facade returns open document page metadata");
+            if(page) {
+                check(page.value().size.width == 540.0, "facade preserves CropBox width");
+                check(
+                    page.value().rotation == PageRotation::degrees_90,
+                    "facade preserves page rotation"
+                );
+            }
+            const auto rendered = application.render_page(0U, 1.0);
+            check(rendered.has_value(), "facade renders an open document page");
+            if(rendered) {
+                constexpr std::array<std::uint8_t, 8> png_signature{
+                    137U, 80U, 78U, 71U, 13U, 10U, 26U, 10U,
+                };
+                check(
+                    rendered.value().png.size() >= png_signature.size()
+                        && std::equal(
+                            png_signature.begin(),
+                            png_signature.end(),
+                            rendered.value().png.begin()
+                        ),
+                    "facade render returns PNG bytes"
+                );
+            }
+            const auto text = application.extract_page_text(0U);
+            check(
+                text.has_value()
+                    && text.value().text.find("Context Reader P1") != std::string::npos,
+                "facade extracts page text"
+            );
+            const auto missing_page = application.page_info(1U);
+            check(!missing_page.has_value(), "facade rejects an out-of-range page");
+        }
         const auto facade_documents = application.list_documents();
         check(
             facade_documents.has_value() && facade_documents.value().size() == 1U,
@@ -191,6 +233,16 @@ int main() {
             reopened_facade_documents.has_value() && reopened_facade_documents.value().size() == 1U,
             "facade documents survive restart"
         );
+        if(reopened_facade_documents && !reopened_facade_documents.value().empty()) {
+            check(
+                application.open_document(
+                    reopened_facade_documents.value().front().document_id
+                ).has_value(),
+                "facade reopens a document after workspace restart"
+            );
+            check(application.close_document().has_value(), "facade closes the document session");
+            check(!application.page_info(0U).has_value(), "closed document rejects page operations");
+        }
     }
 
     if(failures == 0) {

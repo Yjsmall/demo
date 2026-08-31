@@ -1,6 +1,8 @@
-#include <node_api.h>
+#include <napi.h>
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -25,6 +27,11 @@ enum class Operation {
     close_workspace,
     import_document,
     list_documents,
+    open_document,
+    close_document,
+    page_info,
+    render_page,
+    extract_page_text,
     verify_workspace,
 };
 
@@ -48,18 +55,27 @@ struct AddonContext final {
               {this, Operation::close_workspace},
               {this, Operation::import_document},
               {this, Operation::list_documents},
+              {this, Operation::open_document},
+              {this, Operation::close_document},
+              {this, Operation::page_info},
+              {this, Operation::render_page},
+              {this, Operation::extract_page_text},
               {this, Operation::verify_workspace},
           }} {}
 
     std::shared_ptr<RuntimeState> state;
-    std::array<FunctionData, 6> functions;
+    std::array<FunctionData, 11> functions;
 };
 
 using Payload = std::variant<
     std::monostate,
     WorkspaceInfo,
     ImportDocumentResult,
+    DocumentRecord,
     std::vector<DocumentRecord>,
+    PageInfo,
+    EncodedPageImage,
+    PageText,
     WorkspaceVerification>;
 
 struct AsyncWork final {
@@ -68,6 +84,9 @@ struct AsyncWork final {
     std::shared_ptr<RuntimeState> state;
     Operation operation;
     std::filesystem::path path;
+    std::optional<DocumentId> document_id;
+    std::size_t page_index = 0;
+    double pixels_per_point = 1.0;
     Payload payload;
     std::optional<Error> error;
 };
@@ -91,22 +110,16 @@ bool set_number(napi_env env, napi_value object, const char* name, std::uint64_t
         && set_property(env, object, name, property);
 }
 
+bool set_double(napi_env env, napi_value object, const char* name, double value) {
+    napi_value property = nullptr;
+    return napi_create_double(env, value, &property) == napi_ok
+        && set_property(env, object, name, property);
+}
+
 bool set_boolean(napi_env env, napi_value object, const char* name, bool value) {
     napi_value property = nullptr;
     return napi_get_boolean(env, value, &property) == napi_ok
         && set_property(env, object, name, property);
-}
-
-template <typename Tag>
-std::string id_string(const StableId<Tag>& id) {
-    constexpr char digits[] = "0123456789abcdef";
-    std::string result(32, '0');
-    for(std::size_t index = 0; index < id.bytes().size(); ++index) {
-        const auto byte = id.bytes()[index];
-        result[index * 2] = digits[byte >> 4U];
-        result[index * 2 + 1] = digits[byte & 0x0FU];
-    }
-    return result;
 }
 
 const char* error_code(ErrorCode code) {
@@ -142,7 +155,7 @@ napi_value workspace_value(napi_env env, const WorkspaceInfo& info) {
     napi_value result = nullptr;
     napi_value version = nullptr;
     if(napi_create_object(env, &result) != napi_ok
-       || !set_string(env, result, "id", id_string(info.id))
+       || !set_string(env, result, "id", stable_id_to_hex(info.id))
        || napi_create_uint32(env, info.schema_version, &version) != napi_ok
        || !set_property(env, result, "schemaVersion", version)) {
         return nullptr;
@@ -153,8 +166,8 @@ napi_value workspace_value(napi_env env, const WorkspaceInfo& info) {
 napi_value document_value(napi_env env, const DocumentRecord& document) {
     napi_value result = nullptr;
     if(napi_create_object(env, &result) != napi_ok
-       || !set_string(env, result, "documentId", id_string(document.document_id))
-       || !set_string(env, result, "versionId", id_string(document.version_id))
+       || !set_string(env, result, "documentId", stable_id_to_hex(document.document_id))
+       || !set_string(env, result, "versionId", stable_id_to_hex(document.version_id))
        || !set_string(env, result, "title", document.title)
        || !set_string(env, result, "contentSha256", document.content_sha256)
        || !set_string(env, result, "objectKey", document.object_key)
@@ -191,6 +204,81 @@ napi_value documents_value(napi_env env, const std::vector<DocumentRecord>& docu
         }
     }
     return result;
+}
+
+napi_value page_info_value(napi_env env, const PageInfo& page) {
+    napi_value result = nullptr;
+    if(napi_create_object(env, &result) != napi_ok
+       || !set_number(env, result, "index", page.index)
+       || !set_double(env, result, "widthPoints", page.size.width)
+       || !set_double(env, result, "heightPoints", page.size.height)
+       || !set_number(
+           env,
+           result,
+           "rotation",
+           static_cast<std::uint16_t>(page.rotation)
+       )) {
+        return nullptr;
+    }
+    return result;
+}
+
+napi_value rendered_page_value(napi_env env, const EncodedPageImage& rendered) {
+    napi_value result = nullptr;
+    napi_value png = nullptr;
+    void* copied_data = nullptr;
+    if(napi_create_object(env, &result) != napi_ok
+       || !set_number(env, result, "widthPixels", rendered.width_pixels)
+       || !set_number(env, result, "heightPixels", rendered.height_pixels)
+       || !set_double(env, result, "pixelsPerPoint", rendered.pixels_per_point)
+       || napi_create_buffer_copy(
+           env,
+           rendered.png.size(),
+           rendered.png.data(),
+           &copied_data,
+           &png
+       ) != napi_ok
+       || !set_property(env, result, "png", png)) {
+        return nullptr;
+    }
+    return result;
+}
+
+napi_value rect_value(napi_env env, const PageRect& bounds) {
+    napi_value result = nullptr;
+    if(napi_create_object(env, &result) != napi_ok
+       || !set_double(env, result, "x", bounds.x)
+       || !set_double(env, result, "y", bounds.y)
+       || !set_double(env, result, "width", bounds.width)
+       || !set_double(env, result, "height", bounds.height)) {
+        return nullptr;
+    }
+    return result;
+}
+
+napi_value page_text_value(napi_env env, const PageText& page_text) {
+    napi_value result = nullptr;
+    napi_value lines = nullptr;
+    if(page_text.lines.size() > std::numeric_limits<std::uint32_t>::max()
+       || napi_create_object(env, &result) != napi_ok
+       || !set_string(env, result, "text", page_text.text)
+       || napi_create_array_with_length(env, page_text.lines.size(), &lines) != napi_ok) {
+        return nullptr;
+    }
+    for(std::size_t index = 0; index < page_text.lines.size(); ++index) {
+        const auto& source = page_text.lines[index];
+        napi_value line = nullptr;
+        const auto bounds = rect_value(env, source.bounds);
+        if(bounds == nullptr || napi_create_object(env, &line) != napi_ok
+           || !set_string(env, line, "text", source.text)
+           || !set_property(env, line, "bounds", bounds)
+           || !set_boolean(env, line, "vertical", source.vertical)
+           || napi_set_element(env, lines, static_cast<std::uint32_t>(index), line)
+                  != napi_ok) {
+            return nullptr;
+        }
+    }
+    return set_property(env, result, "lines", lines) ? result : nullptr;
 }
 
 napi_value verification_value(napi_env env, const WorkspaceVerification& check) {
@@ -243,6 +331,17 @@ void execute(napi_env, void* data) {
             case Operation::close_workspace: store(app.close_workspace(), work); break;
             case Operation::import_document: store(app.import_document(work.path), work); break;
             case Operation::list_documents: store(app.list_documents(), work); break;
+            case Operation::open_document:
+                store(app.open_document(*work.document_id), work);
+                break;
+            case Operation::close_document: store(app.close_document(), work); break;
+            case Operation::page_info: store(app.page_info(work.page_index), work); break;
+            case Operation::render_page:
+                store(app.render_page(work.page_index, work.pixels_per_point), work);
+                break;
+            case Operation::extract_page_text:
+                store(app.extract_page_text(work.page_index), work);
+                break;
             case Operation::verify_workspace: store(app.verify_workspace(), work); break;
         }
     } catch(const std::exception& exception) {
@@ -263,8 +362,16 @@ napi_value payload_value(napi_env env, const Payload& payload) {
                 return workspace_value(env, value);
             } else if constexpr(std::is_same_v<T, ImportDocumentResult>) {
                 return import_value(env, value);
+            } else if constexpr(std::is_same_v<T, DocumentRecord>) {
+                return document_value(env, value);
             } else if constexpr(std::is_same_v<T, std::vector<DocumentRecord>>) {
                 return documents_value(env, value);
+            } else if constexpr(std::is_same_v<T, PageInfo>) {
+                return page_info_value(env, value);
+            } else if constexpr(std::is_same_v<T, EncodedPageImage>) {
+                return rendered_page_value(env, value);
+            } else if constexpr(std::is_same_v<T, PageText>) {
+                return page_text_value(env, value);
             } else {
                 return verification_value(env, value);
             }
@@ -301,36 +408,63 @@ void complete(napi_env env, napi_status status, void* data) {
     napi_delete_async_work(env, work->work);
 }
 
-std::optional<std::string> path_argument(
+std::optional<std::string> string_argument(
     napi_env env,
-    napi_callback_info info,
-    void** function_data
+    napi_value argument,
+    const char* message
 ) {
-    std::size_t count = 1;
-    napi_value argument = nullptr;
-    if(napi_get_cb_info(env, info, &count, &argument, nullptr, function_data) != napi_ok
-       || count != 1) {
-        napi_throw_type_error(env, "INVALID_ARGUMENT", "Expected one path argument");
-        return std::nullopt;
-    }
     napi_valuetype type = napi_undefined;
     if(napi_typeof(env, argument, &type) != napi_ok || type != napi_string) {
-        napi_throw_type_error(env, "INVALID_ARGUMENT", "Path must be a string");
+        napi_throw_type_error(env, "INVALID_ARGUMENT", message);
         return std::nullopt;
     }
     std::size_t size = 0;
     if(napi_get_value_string_utf8(env, argument, nullptr, 0, &size) != napi_ok) {
-        napi_throw_type_error(env, "INVALID_ARGUMENT", "Path must be valid UTF-8");
+        napi_throw_type_error(env, "INVALID_ARGUMENT", "String must be valid UTF-8");
         return std::nullopt;
     }
     std::string value(size + 1, '\0');
     std::size_t written = 0;
     if(napi_get_value_string_utf8(env, argument, value.data(), value.size(), &written) != napi_ok) {
-        napi_throw_type_error(env, "INVALID_ARGUMENT", "Path must be valid UTF-8");
+        napi_throw_type_error(env, "INVALID_ARGUMENT", "String must be valid UTF-8");
         return std::nullopt;
     }
     value.resize(written);
     return value;
+}
+
+std::optional<double> number_argument(
+    napi_env env,
+    napi_value argument,
+    const char* message
+) {
+    napi_valuetype type = napi_undefined;
+    double value = 0.0;
+    if(napi_typeof(env, argument, &type) != napi_ok || type != napi_number
+       || napi_get_value_double(env, argument, &value) != napi_ok) {
+        napi_throw_type_error(env, "INVALID_ARGUMENT", message);
+        return std::nullopt;
+    }
+    return value;
+}
+
+std::optional<std::size_t> page_index_argument(napi_env env, napi_value argument) {
+    const auto value = number_argument(env, argument, "Page index must be a non-negative integer");
+    constexpr double maximum_safe_integer = 9'007'199'254'740'991.0;
+    const auto maximum_index = std::min(
+        maximum_safe_integer,
+        static_cast<double>(std::numeric_limits<std::size_t>::max())
+    );
+    if(!value || !std::isfinite(*value) || *value < 0.0 || std::floor(*value) != *value
+       || *value > maximum_index) {
+        if(value) {
+            napi_throw_range_error(
+                env, "INVALID_ARGUMENT", "Page index must be a non-negative integer"
+            );
+        }
+        return std::nullopt;
+    }
+    return static_cast<std::size_t>(*value);
 }
 
 napi_value schedule(napi_env env, napi_callback_info info) {
@@ -340,22 +474,100 @@ napi_value schedule(napi_env env, napi_callback_info info) {
         napi_throw_error(env, "NAPI_ARGUMENT_FAILED", "Failed to read arguments");
         return nullptr;
     }
-    const auto& function = *static_cast<FunctionData*>(raw_data);
-    std::optional<std::string> path;
-    if(function.operation == Operation::create_workspace
-       || function.operation == Operation::open_workspace
-       || function.operation == Operation::import_document) {
-        path = path_argument(env, info, &raw_data);
-        if(!path) {
-            return nullptr;
-        }
+    if(count > 2U) {
+        napi_throw_type_error(env, "INVALID_ARGUMENT", "Too many arguments");
+        return nullptr;
     }
-
+    std::array<napi_value, 2> arguments{};
+    auto copied_count = count;
+    if(napi_get_cb_info(
+           env, info, &copied_count, arguments.data(), nullptr, &raw_data
+       ) != napi_ok
+       || copied_count != count) {
+        napi_throw_error(env, "NAPI_ARGUMENT_FAILED", "Failed to read arguments");
+        return nullptr;
+    }
+    const auto& function = *static_cast<FunctionData*>(raw_data);
     auto work = std::make_unique<AsyncWork>();
     work->state = function.context->state;
     work->operation = function.operation;
-    if(path) {
-        work->path = utf8_path(*path);
+    const auto expect_count = [env, count](std::size_t expected, const char* message) {
+        if(count == expected) {
+            return true;
+        }
+        napi_throw_type_error(env, "INVALID_ARGUMENT", message);
+        return false;
+    };
+    switch(function.operation) {
+        case Operation::create_workspace:
+        case Operation::open_workspace:
+        case Operation::import_document: {
+            if(!expect_count(1, "Expected one path argument")) {
+                return nullptr;
+            }
+            const auto value = string_argument(env, arguments[0], "Path must be a string");
+            if(!value) {
+                return nullptr;
+            }
+            work->path = utf8_path(*value);
+            break;
+        }
+        case Operation::open_document: {
+            if(!expect_count(1, "Expected one document ID argument")) {
+                return nullptr;
+            }
+            const auto value = string_argument(
+                env, arguments[0], "Document ID must be a hexadecimal string"
+            );
+            if(!value) {
+                return nullptr;
+            }
+            work->document_id = stable_id_from_hex<DocumentIdTag>(*value);
+            if(!work->document_id) {
+                napi_throw_range_error(
+                    env,
+                    "INVALID_ARGUMENT",
+                    "Document ID must contain exactly 32 hexadecimal characters"
+                );
+                return nullptr;
+            }
+            break;
+        }
+        case Operation::page_info:
+        case Operation::extract_page_text: {
+            if(!expect_count(1, "Expected one page index argument")) {
+                return nullptr;
+            }
+            const auto page_index = page_index_argument(env, arguments[0]);
+            if(!page_index) {
+                return nullptr;
+            }
+            work->page_index = *page_index;
+            break;
+        }
+        case Operation::render_page: {
+            if(!expect_count(2, "Expected page index and pixels-per-point arguments")) {
+                return nullptr;
+            }
+            const auto page_index = page_index_argument(env, arguments[0]);
+            const auto pixels_per_point = number_argument(
+                env, arguments[1], "Pixels per point must be a number"
+            );
+            if(!page_index || !pixels_per_point) {
+                return nullptr;
+            }
+            work->page_index = *page_index;
+            work->pixels_per_point = *pixels_per_point;
+            break;
+        }
+        case Operation::close_workspace:
+        case Operation::list_documents:
+        case Operation::close_document:
+        case Operation::verify_workspace:
+            if(!expect_count(0, "This operation does not accept arguments")) {
+                return nullptr;
+            }
+            break;
     }
     napi_value promise = nullptr;
     napi_value resource_name = nullptr;
@@ -375,15 +587,15 @@ napi_value schedule(napi_env env, napi_callback_info info) {
     return promise;
 }
 
-napi_value runtime_info(napi_env env, napi_callback_info info) {
+Napi::Value runtime_info(const Napi::CallbackInfo& info) {
+    const auto env = info.Env();
     try {
-        void* raw_data = nullptr;
-        std::size_t count = 0;
-        if(napi_get_cb_info(env, info, &count, nullptr, nullptr, &raw_data) != napi_ok) {
-            napi_throw_error(env, "NAPI_ARGUMENT_FAILED", "Failed to read arguments");
-            return nullptr;
+        if(info.Length() != 0) {
+            Napi::TypeError::New(env, "This operation does not accept arguments")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
         }
-        const auto& context = *static_cast<AddonContext*>(raw_data);
+        const auto& context = *static_cast<AddonContext*>(info.Data());
         const auto runtime = context.state->runtime->application().runtime_info();
         char version[32]{};
         const int written = std::snprintf(
@@ -395,27 +607,25 @@ napi_value runtime_info(napi_env env, napi_callback_info info) {
             runtime.version.patch
         );
         if(written < 0 || static_cast<std::size_t>(written) >= sizeof(version)) {
-            napi_throw_error(env, "VERSION_FORMAT_FAILED", "Runtime version formatting failed");
-            return nullptr;
+            Napi::Error::New(env, "Runtime version formatting failed")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
         }
-        napi_value result = nullptr;
-        napi_value version_value = nullptr;
-        napi_value api_version = nullptr;
-        napi_value binding_version = nullptr;
-        if(napi_create_object(env, &result) != napi_ok
-           || napi_create_string_utf8(env, version, NAPI_AUTO_LENGTH, &version_value) != napi_ok
-           || napi_create_uint32(env, runtime.application_api_version, &api_version) != napi_ok
-           || napi_create_uint32(env, NAPI_VERSION, &binding_version) != napi_ok
-           || !set_property(env, result, "version", version_value)
-           || !set_property(env, result, "applicationApiVersion", api_version)
-           || !set_property(env, result, "bindingNapiVersion", binding_version)) {
-            napi_throw_error(env, "NAPI_RESULT_FAILED", "Failed to create runtime info");
-            return nullptr;
-        }
+        auto result = Napi::Object::New(env);
+        result.Set("version", Napi::String::New(env, version));
+        result.Set(
+            "applicationApiVersion",
+            Napi::Number::New(env, runtime.application_api_version)
+        );
+        result.Set("bindingNapiVersion", Napi::Number::New(env, NAPI_VERSION));
         return result;
+    } catch(const std::exception& exception) {
+        Napi::Error::New(env, exception.what()).ThrowAsJavaScriptException();
+        return env.Undefined();
     } catch(...) {
-        napi_throw_error(env, "NATIVE_EXCEPTION", "Native runtime operation failed");
-        return nullptr;
+        Napi::Error::New(env, "Native runtime operation failed")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
     }
 }
 
@@ -435,36 +645,41 @@ void cleanup(void* data) {
     delete static_cast<AddonContext*>(data);
 }
 
-napi_value initialize(napi_env env, napi_value exports) {
+Napi::Object initialize(Napi::Env env, Napi::Object exports) {
     auto runtime = ReaderRuntime::create();
     if(!runtime) {
-        napi_throw_error(env, "RUNTIME_CREATE_FAILED", "ReaderRuntime creation failed");
-        return nullptr;
+        Napi::Error::New(env, "ReaderRuntime creation failed").ThrowAsJavaScriptException();
+        return exports;
     }
     auto context = std::make_unique<AddonContext>(
         std::make_shared<RuntimeState>(std::move(runtime).value())
     );
-    constexpr std::array<const char*, 6> names{
+    constexpr std::array<const char*, 11> names{
         "createWorkspace",
         "openWorkspace",
         "closeWorkspace",
         "importDocument",
         "listDocuments",
+        "openDocument",
+        "closeDocument",
+        "pageInfo",
+        "renderPage",
+        "extractPageText",
         "verifyWorkspace",
     };
-    if(!export_function(env, exports, "runtimeInfo", runtime_info, context.get())) {
-        napi_throw_error(env, "NAPI_INIT_FAILED", "Failed to initialize reader_node");
-        return nullptr;
-    }
+    exports.Set(
+        "runtimeInfo",
+        Napi::Function::New(env, runtime_info, "runtimeInfo", context.get())
+    );
     for(std::size_t index = 0; index < names.size(); ++index) {
         if(!export_function(env, exports, names[index], schedule, &context->functions[index])) {
             napi_throw_error(env, "NAPI_INIT_FAILED", "Failed to initialize reader_node");
-            return nullptr;
+            return exports;
         }
     }
     if(napi_add_env_cleanup_hook(env, cleanup, context.get()) != napi_ok) {
         napi_throw_error(env, "NAPI_INIT_FAILED", "Failed to register cleanup hook");
-        return nullptr;
+        return exports;
     }
     context.release();
     return exports;
@@ -472,4 +687,4 @@ napi_value initialize(napi_env env, napi_value exports) {
 
 }  // namespace
 
-NAPI_MODULE(NODE_GYP_MODULE_NAME, initialize)
+NODE_API_MODULE(NODE_GYP_MODULE_NAME, initialize)

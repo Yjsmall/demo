@@ -671,6 +671,67 @@ public:
         return Result<std::vector<DocumentRecord>>::success(std::move(documents));
     }
 
+    [[nodiscard]] Result<ResolvedDocumentObject> resolve_document(DocumentId document_id) {
+        const std::scoped_lock lock(mutex_);
+        auto statement_result = prepare(
+            database_.get(),
+            "SELECT d.id, v.id, d.title, v.content_hash, v.object_key, d.active_version_id, "
+            "v.byte_length, v.page_count "
+            "FROM documents d JOIN document_versions v ON v.id = d.active_version_id "
+            "WHERE d.id = ?1 LIMIT 1"
+        );
+        if(!statement_result) {
+            return Result<ResolvedDocumentObject>::failure(statement_result.error());
+        }
+        auto statement = std::move(statement_result).value();
+        if(!bind_id(statement.get(), 1, document_id)) {
+            return Result<ResolvedDocumentObject>::failure(
+                Error(ErrorCode::storage_failure, "Document ID could not be bound")
+            );
+        }
+        const auto step_result = sqlite3_step(statement.get());
+        if(step_result == SQLITE_DONE) {
+            return Result<ResolvedDocumentObject>::failure(
+                Error(ErrorCode::not_found, "Document was not found")
+            );
+        }
+        if(step_result != SQLITE_ROW) {
+            return Result<ResolvedDocumentObject>::failure(
+                Error(ErrorCode::storage_failure, "Document lookup failed")
+            );
+        }
+        auto record_result = read_document_record(statement.get());
+        if(!record_result) {
+            return Result<ResolvedDocumentObject>::failure(record_result.error());
+        }
+        auto record = std::move(record_result).value();
+        const std::filesystem::path object_key(record.object_key);
+        bool unsafe_path = object_key.empty() || object_key.is_absolute();
+        for(const auto& component : object_key) {
+            if(component == "..") {
+                unsafe_path = true;
+            }
+        }
+        if(unsafe_path) {
+            return Result<ResolvedDocumentObject>::failure(
+                Error(ErrorCode::storage_failure, "Document object path is invalid")
+            );
+        }
+        const auto object_path = root_ / object_key;
+        std::error_code filesystem_error;
+        if(!std::filesystem::is_regular_file(object_path, filesystem_error) || filesystem_error) {
+            return Result<ResolvedDocumentObject>::failure(
+                Error(ErrorCode::storage_failure, "Document object is missing")
+            );
+        }
+        return Result<ResolvedDocumentObject>::success(
+            ResolvedDocumentObject{
+                .document = std::move(record),
+                .path = object_path,
+            }
+        );
+    }
+
     [[nodiscard]] Result<WorkspaceVerification> verify() {
         const std::scoped_lock lock(mutex_);
         WorkspaceVerification verification{
@@ -942,6 +1003,10 @@ Result<ImportDocumentResult> SqliteWorkspace::import_pdf(const std::filesystem::
 
 Result<std::vector<DocumentRecord>> SqliteWorkspace::list_documents() {
     return implementation_->list_documents();
+}
+
+Result<ResolvedDocumentObject> SqliteWorkspace::resolve_document(DocumentId document_id) {
+    return implementation_->resolve_document(document_id);
 }
 
 Result<WorkspaceVerification> SqliteWorkspace::verify() {
