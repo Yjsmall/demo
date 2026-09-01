@@ -4,6 +4,7 @@ EXPORTS
     napi_close_escapable_handle_scope
     napi_close_handle_scope
     napi_create_array_with_length
+    napi_create_arraybuffer
     napi_create_async_work
     napi_create_buffer_copy
     napi_create_double

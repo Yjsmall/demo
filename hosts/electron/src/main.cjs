@@ -6,8 +6,7 @@ const projectRoot = path.resolve(__dirname, '..', '..', '..');
 const addonPath = path.join(projectRoot, 'build', 'node-ucrt64', 'reader_node.node');
 const utilityPath = path.join(__dirname, 'utility.cjs');
 const timeoutMs = 15_000;
-const expectedElectronVersion = '44.0.0';
-const expectedNodeVersion = '24.18.1';
+const expectedElectronVersion = '44.1.0';
 const expectedBindingNapiVersion = 8;
 
 let child = null;
@@ -52,9 +51,9 @@ app.whenReady().then(() => {
       message?.status === 'ok'
       && message.processType === 'utility'
       && message.processVersions?.electron === expectedElectronVersion
-      && message.processVersions?.node === expectedNodeVersion
+      && typeof message.processVersions?.node === 'string'
       && message.runtimeInfo?.version === '0.1.0'
-      && message.runtimeInfo?.applicationApiVersion === 3
+      && message.runtimeInfo?.applicationApiVersion === 6
       && message.runtimeInfo?.bindingNapiVersion === expectedBindingNapiVersion
     ) {
       finish(

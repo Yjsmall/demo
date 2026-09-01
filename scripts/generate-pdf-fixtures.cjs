@@ -95,6 +95,69 @@ const columnsDocument = buildPdf('double-column', [
 ]);
 fs.writeFileSync(path.join(corpusRoot, 'double-column.pdf'), columnsDocument, 'ascii');
 
+const complexHorizontalCmap = `/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def
+/CMapName /ContextReaderHorizontal def
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+4 beginbfchar
+<0001> <FB01>
+<0002> <05E9>
+<0003> <05DC>
+<0004> <05D5>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+`;
+const complexVerticalCmap = `/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def
+/CMapName /ContextReaderVertical def
+/CMapType 2 def
+/WMode 1 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+3 beginbfchar
+<0001> <7E26>
+<0002> <66F8>
+<0003> <304D>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+`;
+const complexContent = `BT /F1 16 Tf
+50 740 Td (Partial line selection target) Tj
+0 -24 Td (continues across the next line) Tj
+ET
+BT /FH 24 Tf 50 620 Td <0001000200030004> Tj ET
+BT /FV 24 Tf 430 700 Td <000100020003> Tj ET
+`;
+const complexDocument = buildPdf('selection-complex', [
+  '<< /Type /Catalog /Pages 2 0 R >>',
+  '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+  '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources << /Font << /F1 4 0 R /FH 5 0 R /FV 8 0 R >> >> /Contents 11 0 R >>',
+  '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  '<< /Type /Font /Subtype /Type0 /BaseFont /ContextReaderHorizontal /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 7 0 R >>',
+  '<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Arial /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 12 0 R /DW 1000 /CIDToGIDMap /Identity >>',
+  stream('', complexHorizontalCmap),
+  '<< /Type /Font /Subtype /Type0 /BaseFont /ContextReaderVertical /Encoding /Identity-V /DescendantFonts [9 0 R] /ToUnicode 10 0 R >>',
+  '<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Arial /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 12 0 R /DW 1000 /CIDToGIDMap /Identity >>',
+  stream('', complexVerticalCmap),
+  stream('', complexContent),
+  '<< /Type /FontDescriptor /FontName /Arial /Flags 32 /FontBBox [-665 -325 2000 1040] /ItalicAngle 0 /Ascent 905 /Descent -211 /CapHeight 716 /StemV 80 >>',
+]);
+fs.writeFileSync(path.join(corpusRoot, 'selection-complex.pdf'), complexDocument, 'ascii');
+
 const imageSize = 32;
 let imageHex = '';
 for (let y = 0; y < imageSize; y += 1) {

@@ -36,7 +36,7 @@ if (-not $Force -and $installationComplete -and $installedHash -ceq $lockHash) {
 
 Push-Location $projectRoot
 try {
-    & npm ci --no-audit --no-fund
+    & npm ci --no-audit --no-fund --legacy-peer-deps
     if ($LASTEXITCODE -ne 0) {
         throw "npm ci failed with exit code $LASTEXITCODE"
     }

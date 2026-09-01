@@ -18,7 +18,8 @@ TEST_CASE("reader runtime reports its API and executes work") {
     auto runtime = std::move(runtime_result).value();
     const auto info = runtime->application().runtime_info();
     CHECK(info.version == RuntimeVersion{0, 1, 0});
-    CHECK(info.application_api_version == 5U);
+    CHECK(info.application_api_version == 6U);
+    CHECK_FALSE(info.capabilities.empty());
     CHECK(runtime->executor().concurrency() > 0);
 
     std::atomic_bool task_ran{false};

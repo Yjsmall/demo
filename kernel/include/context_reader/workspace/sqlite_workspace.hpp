@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include "context_reader/annotation/annotation.hpp"
@@ -30,6 +31,13 @@ public:
     [[nodiscard]] static Result<WorkspaceInspection> inspect(
         const std::filesystem::path& root
     );
+    [[nodiscard]] static Result<BackupInspection> inspect_package(
+        const std::filesystem::path& package_path
+    );
+    [[nodiscard]] static Result<WorkspaceInfo> restore_package(
+        const std::filesystem::path& package_path,
+        const std::filesystem::path& empty_target
+    );
 
     SqliteWorkspace(const SqliteWorkspace&) = delete;
     SqliteWorkspace& operator=(const SqliteWorkspace&) = delete;
@@ -52,6 +60,20 @@ public:
     [[nodiscard]] Result<NoteRecord> update_note(const UpdateNote& command);
     [[nodiscard]] Result<std::vector<NoteRecord>> list_notes(
         DocumentVersionId document_version_id
+    );
+    [[nodiscard]] Result<void> rebuild_search_index(
+        const CancellationToken& cancellation = CancellationToken{}
+    );
+    [[nodiscard]] Result<SearchResponse> search(std::string_view query, std::size_t limit);
+    [[nodiscard]] Result<AssetRecord> import_note_asset(
+        AnnotationId annotation_id,
+        const std::filesystem::path& source,
+        const CancellationToken& cancellation = CancellationToken{}
+    );
+    [[nodiscard]] Result<AssetData> read_asset(AssetId asset_id);
+    [[nodiscard]] Result<BackupInspection> export_package(
+        const std::filesystem::path& destination,
+        const CancellationToken& cancellation = CancellationToken{}
     );
     [[nodiscard]] Result<WorkspaceVerification> verify();
     [[nodiscard]] Result<OrphanCleanupResult> cleanup_orphaned_objects();

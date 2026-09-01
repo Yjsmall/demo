@@ -1,4 +1,5 @@
 const path = require('node:path');
+const fs = require('node:fs/promises');
 
 const operations = new Set([
   'createWorkspace',
@@ -10,15 +11,26 @@ const operations = new Set([
   'closeDocument',
   'pageInfo',
   'renderPage',
+  'renderTile',
   'extractPageText',
+  'pageTextLayout',
+  'selectText',
   'createAnnotation',
   'listAnnotations',
   'deleteAnnotation',
   'updateNote',
   'listNotes',
+  'rebuildSearchIndex',
+  'search',
+  'importNoteAsset',
+  'readAsset',
+  'exportWorkspace',
+  'inspectBackup',
+  'restoreWorkspace',
   'verifyWorkspace',
+  'exportDiagnostics',
 ]);
-const jobOperations = new Set(['importDocument', 'openDocument', 'renderPage']);
+const jobOperations = new Set(['importDocument', 'openDocument', 'renderPage', 'renderTile', 'rebuildSearchIndex', 'importNoteAsset', 'exportWorkspace', 'restoreWorkspace', 'exportDiagnostics']);
 
 function send(message) {
   process.parentPort.postMessage(message);
@@ -28,9 +40,34 @@ try {
   const addonPath = path.resolve(process.argv[2]);
   const readerNode = require(addonPath);
   let responseFaultOperation = null;
+  let dataPort = null;
+  const recentErrorCodes = [];
 
   process.parentPort.on('message', async (event) => {
     const message = event?.data ?? event;
+    if (message?.kind === 'data-port' && event?.ports?.[0]) {
+      dataPort?.close();
+      dataPort = event.ports[0];
+      dataPort.on('message', async (dataEvent) => {
+        const request = dataEvent?.data ?? dataEvent;
+        if (request?.kind === 'cancel-job' && typeof request.jobId === 'string') {
+          readerNode.cancelJob(request.jobId);
+          return;
+        }
+        if (request?.kind !== 'tile-request' || typeof request.jobId !== 'string') return;
+        try {
+          const value = await readerNode.renderTile(request.request, request.jobId);
+          dataPort.postMessage({ kind: 'tile-response', jobId: request.jobId, ok: true, value });
+        } catch (error) {
+          dataPort.postMessage({
+            kind: 'tile-response', jobId: request.jobId, ok: false,
+            error: { code: typeof error?.code === 'string' ? error.code : 'INTERNAL', message: String(error?.message || error) },
+          });
+        }
+      });
+      dataPort.start();
+      return;
+    }
     if (message?.kind === 'cancel-job' && typeof message.jobId === 'string') {
       readerNode.cancelJob(message.jobId);
       return;
@@ -63,6 +100,30 @@ try {
     }
 
     try {
+      if (message.operation === 'exportDiagnostics') {
+        const destination = message.arguments?.[0];
+        if (typeof destination !== 'string' || destination.length === 0) {
+          const error = new Error('Diagnostics destination must be a path');
+          error.code = 'INVALID_ARGUMENT';
+          throw error;
+        }
+        const runtime = readerNode.runtimeInfo();
+        const diagnostics = {
+          format: 'context-reader-diagnostics',
+          version: 1,
+          buildId: runtime.buildId,
+          applicationVersion: runtime.version,
+          applicationApiVersion: runtime.applicationApiVersion,
+          workspaceSchemaVersion: 4,
+          capabilities: runtime.capabilities,
+          taskStats: { active: 0 },
+          cacheStats: { redacted: true },
+          recentErrorCodes: [...recentErrorCodes],
+        };
+        await fs.writeFile(destination, `${JSON.stringify(diagnostics, null, 2)}\n`, { flag: 'wx' });
+        send({ kind: 'response', requestId: message.requestId, ok: true, value: { version: 1 } });
+        return;
+      }
       const args = [...(message.arguments ?? [])];
       if (message.jobId && jobOperations.has(message.operation)) args.push(message.jobId);
       const value = await readerNode[message.operation](...args);
@@ -73,12 +134,15 @@ try {
       }
       send({ kind: 'response', requestId: message.requestId, ok: true, value });
     } catch (error) {
+      const errorCode = typeof error?.code === 'string' ? error.code : 'INTERNAL';
+      recentErrorCodes.push(errorCode);
+      if (recentErrorCodes.length > 20) recentErrorCodes.shift();
       send({
         kind: 'response',
         requestId: message.requestId,
         ok: false,
         error: {
-          code: typeof error?.code === 'string' ? error.code : 'INTERNAL',
+          code: errorCode,
           message: error instanceof Error ? error.message : String(error),
         },
       });

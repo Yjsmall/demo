@@ -54,6 +54,12 @@ if(MINGW)
         HINTS "${CONTEXT_READER_MSYS2_ROOT}/ucrt64/bin"
         REQUIRED
     )
+    find_file(
+        CONTEXT_READER_WINPTHREAD_DLL
+        NAMES libwinpthread-1.dll
+        HINTS "${CONTEXT_READER_MSYS2_ROOT}/ucrt64/bin"
+        REQUIRED
+    )
 
     set(_context_reader_electron_import_library "${CMAKE_CURRENT_BINARY_DIR}/libelectron_napi.dll.a")
 
@@ -75,6 +81,13 @@ if(MINGW)
     add_dependencies(reader_node reader_electron_napi_import)
     target_link_libraries(reader_node PRIVATE "${_context_reader_electron_import_library}")
     target_link_options(reader_node PRIVATE -static-libgcc -static-libstdc++)
+    add_custom_command(
+        TARGET reader_node POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${CONTEXT_READER_WINPTHREAD_DLL}"
+            "${CMAKE_BINARY_DIR}/libwinpthread-1.dll"
+        VERBATIM
+    )
 else()
     target_link_libraries(reader_node PRIVATE ${CMAKE_JS_LIB})
 endif()

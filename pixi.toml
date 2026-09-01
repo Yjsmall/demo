@@ -45,3 +45,16 @@ p3-node-contract = { cmd = "npm run test:node-contract:p3", depends-on = ["p2-no
 p3-boundary-contract = { cmd = "pwsh -NoProfile -File scripts/check-boundary-contract.ps1 -FacadeTool build/p2-ucrt64/tools/reader-facade-contract.exe -FixturePath tests/corpus/generated/basic-rotated-cropbox.pdf -OutputRoot build/p3-boundary-contract", depends-on = ["p2-build", "p2-node-import-check"] }
 p3-replay = { cmd = "pwsh -NoProfile -File scripts/check-reader-replay.ps1 -TracePath tests/replay/cancel-render.jsonl -OutputRoot build/p3-replay", depends-on = ["p2-node-import-check"] }
 p3 = { depends-on = ["p2", "p3-single-instance-smoke", "p3-utility-restart-smoke", "p3-node-contract", "p3-boundary-contract", "p3-replay"] }
+renderer-build = "npm run build:renderer"
+p4-1 = { depends-on = ["p2-test", "p2-node-build", "renderer-build"] }
+p4-2 = { depends-on = ["p2-test", "p3-node-contract"] }
+p4-3 = { depends-on = ["p2-test", "renderer-build"] }
+p4-benchmark-smoke = { cmd = "build\\p2-ucrt64\\tools\\reader-bench.exe --smoke tests\\corpus\\generated\\basic-rotated-cropbox.pdf build\\p4-bench.json", depends-on = ["p2-build"] }
+p4-4 = { depends-on = ["p4-benchmark-smoke", "p3-replay"] }
+p4-package = { cmd = "npm run package", depends-on = ["p2-node-build", "renderer-build"] }
+p4-packaged-smoke = { cmd = "npm run smoke:package", depends-on = ["p4-package"] }
+p4-make = { cmd = "npm run make:reuse-package", depends-on = ["p4-packaged-smoke"] }
+p4-package-check = { cmd = "pwsh -NoProfile -File scripts/check-p4-package.ps1", depends-on = ["p4-make"] }
+p4-release-pack = { cmd = "npm run reader-pack", depends-on = ["p4-package-check", "p4-benchmark-smoke"] }
+p4-5 = { depends-on = ["p4-release-pack"] }
+p4 = { depends-on = ["p3", "p4-1", "p4-2", "p4-3", "p4-4", "p4-5"] }

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <optional>
 #include <vector>
 
 #include "context_reader/shared/stable_id.hpp"
@@ -48,6 +49,47 @@ struct WorkspaceVerification final {
 struct OrphanCleanupResult final {
     std::size_t removed_object_count;
     std::uint64_t reclaimed_bytes;
+};
+
+enum class SearchResultKind : std::uint8_t {
+    pdf_page,
+    note,
+};
+
+struct SearchResultItem final {
+    SearchResultKind kind;
+    DocumentVersionId document_version_id;
+    std::optional<NoteId> note_id;
+    std::optional<std::size_t> page_index;
+    std::string title;
+    std::string excerpt;
+};
+
+struct SearchResponse final {
+    std::string index_status;
+    std::vector<SearchResultItem> results;
+};
+
+struct AssetRecord final {
+    AssetId id;
+    std::string content_sha256;
+    std::string media_type;
+    std::uint64_t byte_length;
+    std::uint32_t width;
+    std::uint32_t height;
+};
+
+struct AssetData final {
+    AssetRecord asset;
+    std::vector<std::uint8_t> bytes;
+};
+
+struct BackupInspection final {
+    bool valid;
+    std::uint32_t format_version;
+    std::size_t file_count;
+    std::uint64_t total_uncompressed_bytes;
+    std::vector<std::string> issues;
 };
 
 }  // namespace context_reader

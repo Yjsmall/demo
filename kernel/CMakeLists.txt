@@ -17,6 +17,7 @@ target_include_directories(
 )
 
 target_compile_features(reader_core PUBLIC cxx_std_20)
+target_compile_definitions(reader_core PUBLIC CONTEXT_READER_BUILD_ID="${CONTEXT_READER_BUILD_ID}")
 target_link_libraries(reader_core PRIVATE Asio::Asio)
 context_reader_enable_warnings(reader_core)
 
@@ -32,6 +33,6 @@ if(CONTEXT_READER_ENABLE_WORKSPACE)
         PRIVATE
             src/workspace/sqlite_workspace.cpp
     )
-    target_link_libraries(reader_core PRIVATE SQLite::SQLite3 bcrypt)
+    target_link_libraries(reader_core PRIVATE SQLite::SQLite3 Miniz::Miniz bcrypt ole32 windowscodecs)
     target_compile_definitions(reader_core PUBLIC CONTEXT_READER_HAS_WORKSPACE=1)
 endif()

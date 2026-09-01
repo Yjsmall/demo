@@ -30,10 +30,10 @@ app.whenReady().then(() => {
     clearTimeout(timer);
     child.kill();
     const valid = message?.status === 'ok'
-      && message.runtimeApiVersion === 5
+      && message.runtimeApiVersion === 6
       && message.parameterCheckCount === 6
       && message.unopenedCode === 'NOT_FOUND'
-      && message.workspaceSchemaVersion === 2
+      && message.workspaceSchemaVersion === 4
       && message.workspaceConflict === 'CONFLICT'
       && message.documentCount === 1
       && message.duplicateJobCode === 'CONFLICT'
@@ -42,6 +42,9 @@ app.whenReady().then(() => {
       && message.unknownCancellation === false
       && message.pngByteLength > 8
       && message.pngValid === true
+      && message.tileValid === true
+      && message.selectionValid === true
+      && message.searchValid === true
       && message.revisionConflict === 'CONFLICT'
       && message.annotationCount === 1
       && message.noteCount === 1

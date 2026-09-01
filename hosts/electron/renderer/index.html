@@ -9,6 +9,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Context Reader</title>
     <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="bundle/renderer.css">
   </head>
   <body>
     <section class="window-shell">
@@ -20,6 +21,9 @@
         <div class="workspace-actions">
           <button id="create-workspace" class="secondary-button" type="button">新建工作区</button>
           <button id="open-workspace" class="secondary-button" type="button">打开工作区</button>
+          <button id="export-workspace" class="secondary-button" type="button" disabled>导出</button>
+          <button id="restore-workspace" class="secondary-button" type="button">恢复</button>
+          <button id="export-diagnostics" class="secondary-button" type="button">诊断</button>
           <button id="import-pdf" class="primary-button" type="button" disabled>导入 PDF</button>
         </div>
         <div class="status-region">
@@ -65,11 +69,7 @@
                 <strong>打开一份 PDF 开始阅读</strong>
                 <span>文档、高亮和笔记会保存在当前工作区。</span>
               </div>
-              <div id="page-stage" class="page-stage" hidden>
-                <img id="page-image" alt="PDF 页面">
-                <div id="annotation-layer" class="annotation-layer"></div>
-                <div id="text-layer" class="text-layer"></div>
-              </div>
+              <div id="pages-container" class="pages-container" hidden></div>
             </div>
           </section>
 
@@ -79,8 +79,13 @@
               <button id="delete-annotation" class="danger-button" type="button" title="删除高亮" disabled>删除</button>
             </div>
             <blockquote id="selected-quote">选择一个高亮</blockquote>
-            <label class="note-label" for="note-source">MARKDOWN</label>
+            <div class="note-tabs" role="tablist" aria-label="笔记模式">
+              <button id="note-edit-tab" class="note-tab selected" type="button" role="tab" aria-selected="true">编辑</button>
+              <button id="note-preview-tab" class="note-tab" type="button" role="tab" aria-selected="false">预览</button>
+              <button id="insert-note-asset" class="icon-button" type="button" title="插入图片" aria-label="插入图片" disabled>+</button>
+            </div>
             <textarea id="note-source" aria-label="Markdown 笔记" spellcheck="true" disabled></textarea>
+            <div id="note-preview" class="note-preview" hidden></div>
             <div class="note-footer">
               <span id="note-revision">revision 0</span>
               <button id="save-note" class="primary-button" type="button" disabled>保存笔记</button>
@@ -89,6 +94,6 @@
         </section>
       </main>
     </section>
-    <script src="app.js"></script>
+    <script src="bundle/renderer.js"></script>
   </body>
 </html>

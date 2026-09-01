@@ -103,7 +103,7 @@ Assert-Equal -Name 'Development Node.js' -Actual $nodeVersion -Expected 'v24.19.
 
 $packagePath = Join-Path $projectRoot 'package.json'
 $package = Get-Content -LiteralPath $packagePath -Raw -Encoding UTF8 | ConvertFrom-Json
-Assert-Equal -Name 'Electron package' -Actual $package.devDependencies.electron -Expected '44.0.0'
+Assert-Equal -Name 'Electron package' -Actual $package.devDependencies.electron -Expected '44.1.0'
 Assert-Equal -Name 'CMake.js package' -Actual $package.devDependencies.'cmake-js' -Expected '8.0.0'
 
 Write-Output (

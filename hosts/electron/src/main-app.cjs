@@ -2,20 +2,23 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 
-const { app, BrowserWindow, dialog, ipcMain, utilityProcess } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, MessageChannelMain, net, protocol, session, utilityProcess } = require('electron');
+const { pathToFileURL } = require('node:url');
+
+if (require('electron-squirrel-startup')) app.quit();
 
 const projectRoot = path.resolve(__dirname, '..', '..', '..');
 const addonPath = path.join(projectRoot, 'build', 'node-p2-ucrt64', 'reader_node.node');
 const utilityPath = path.join(__dirname, 'utility-host.cjs');
-const rendererPath = path.join(__dirname, '..', 'renderer', 'index.html');
+const rendererRoot = path.join(__dirname, '..', 'renderer');
 const preloadPath = path.join(__dirname, 'preload.cjs');
 const allowedOperations = new Set([
   'createWorkspace', 'openWorkspace', 'closeWorkspace', 'listDocuments',
-  'closeDocument', 'pageInfo', 'extractPageText',
-  'createAnnotation', 'listAnnotations', 'deleteAnnotation', 'updateNote', 'listNotes',
+  'closeDocument', 'pageInfo', 'extractPageText', 'pageTextLayout', 'selectText', 'search', 'inspectBackup',
+  'createAnnotation', 'listAnnotations', 'deleteAnnotation', 'updateNote', 'listNotes', 'readAsset',
   'verifyWorkspace',
 ]);
-const jobOperations = new Set(['importDocument', 'openDocument', 'renderPage']);
+const jobOperations = new Set(['importDocument', 'openDocument', 'renderPage', 'renderTile', 'rebuildSearchIndex', 'importNoteAsset', 'exportWorkspace', 'restoreWorkspace', 'exportDiagnostics']);
 
 let window = null;
 let child = null;
@@ -35,6 +38,32 @@ let utilityGeneration = 0;
 let desiredWorkspacePath = null;
 let desiredDocumentId = null;
 let utilityRestartAllowed = true;
+
+protocol.registerSchemesAsPrivileged([{
+  scheme: 'app',
+  privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: false },
+}]);
+
+function registerAppProtocol() {
+  protocol.handle('app', (request) => {
+    const url = new URL(request.url);
+    if (url.host !== 'reader') return new Response(null, { status: 404 });
+    const relative = decodeURIComponent(url.pathname).replace(/^\/+/, '') || 'index.html';
+    const resolved = path.resolve(rendererRoot, relative);
+    const relativeCheck = path.relative(rendererRoot, resolved);
+    if (relativeCheck.startsWith('..') || path.isAbsolute(relativeCheck)) {
+      return new Response(null, { status: 404 });
+    }
+    return net.fetch(pathToFileURL(resolved).toString());
+  });
+}
+
+function connectDataPort(utility = child) {
+  if (!utility || utility !== child || !window || window.isDestroyed()) return;
+  const { port1, port2 } = new MessageChannelMain();
+  utility.postMessage({ kind: 'data-port', generation: utilityGeneration }, [port1]);
+  window.webContents.postMessage('reader:data-port', { generation: utilityGeneration }, [port2]);
+}
 
 if (singleInstanceSmoke && process.env.CONTEXT_READER_SINGLE_INSTANCE_USER_DATA) {
   app.setPath('userData', path.resolve(process.env.CONTEXT_READER_SINGLE_INSTANCE_USER_DATA));
@@ -88,6 +117,7 @@ function startUtility() {
   child = utility;
   utility.stdout?.pipe(process.stdout);
   utility.stderr?.pipe(process.stderr);
+  connectDataPort(utility);
 
   utility.on('message', (message) => {
     if (utility !== child || generation !== utilityGeneration) return;
@@ -324,7 +354,7 @@ function registerIpc() {
       error.code = 'INVALID_ARGUMENT';
       throw error;
     }
-    if (['createWorkspace', 'openWorkspace', 'importDocument'].includes(request.operation)) {
+    if (['createWorkspace', 'openWorkspace', 'importDocument', 'inspectBackup'].includes(request.operation)) {
       const requestedPath = request.arguments[0];
       if (typeof requestedPath !== 'string' || !grantedPaths.has(path.resolve(requestedPath))) {
         const error = new Error('Reader path has not been authorized by the host');
@@ -343,9 +373,11 @@ function registerIpc() {
       error.code = 'INVALID_ARGUMENT';
       throw error;
     }
-    if(request.operation === 'importDocument') {
-      const requestedPath = request.arguments[0];
-      if(typeof requestedPath !== 'string' || !grantedPaths.has(path.resolve(requestedPath))) {
+    if(['importDocument', 'importNoteAsset', 'exportWorkspace', 'restoreWorkspace', 'exportDiagnostics'].includes(request.operation)) {
+      const pathIndexes = request.operation === 'importNoteAsset' ? [1]
+        : request.operation === 'restoreWorkspace' ? [0, 1] : [0];
+      if(pathIndexes.some((index) => typeof request.arguments[index] !== 'string'
+          || !grantedPaths.has(path.resolve(request.arguments[index])))) {
         const error = new Error('Reader path has not been authorized by the host');
         error.code = 'INVALID_ARGUMENT';
         throw error;
@@ -402,6 +434,67 @@ function registerIpc() {
     return selectedPath;
   });
 
+  ipcMain.handle('reader:choose-note-asset', async (event) => {
+    if (event.sender !== window?.webContents) return null;
+    const result = await dialog.showOpenDialog(window, {
+      title: '插入图片',
+      properties: ['openFile'],
+      filters: [{ name: 'PNG 或 JPEG', extensions: ['png', 'jpg', 'jpeg'] }],
+    });
+    if (result.canceled) return null;
+    const selectedPath = path.resolve(result.filePaths[0]);
+    grantedPaths.add(selectedPath);
+    return selectedPath;
+  });
+
+  ipcMain.handle('reader:choose-backup-export', async (event) => {
+    if (event.sender !== window?.webContents) return null;
+    const result = await dialog.showSaveDialog(window, {
+      title: '导出工作区备份',
+      defaultPath: 'context-reader.readerpkg',
+      filters: [{ name: 'Context Reader Backup', extensions: ['readerpkg'] }],
+    });
+    if (result.canceled || !result.filePath) return null;
+    const selectedPath = path.resolve(result.filePath);
+    grantedPaths.add(selectedPath);
+    return selectedPath;
+  });
+
+  ipcMain.handle('reader:choose-backup-open', async (event) => {
+    if (event.sender !== window?.webContents) return null;
+    const result = await dialog.showOpenDialog(window, {
+      title: '选择工作区备份', properties: ['openFile'],
+      filters: [{ name: 'Context Reader Backup', extensions: ['readerpkg'] }],
+    });
+    if (result.canceled) return null;
+    const selectedPath = path.resolve(result.filePaths[0]);
+    grantedPaths.add(selectedPath);
+    return selectedPath;
+  });
+
+  ipcMain.handle('reader:choose-restore-target', async (event) => {
+    if (event.sender !== window?.webContents) return null;
+    const result = await dialog.showOpenDialog(window, {
+      title: '选择空的恢复目录', properties: ['openDirectory', 'createDirectory'],
+    });
+    if (result.canceled) return null;
+    const selectedPath = path.resolve(result.filePaths[0]);
+    grantedPaths.add(selectedPath);
+    return selectedPath;
+  });
+
+  ipcMain.handle('reader:choose-diagnostics-export', async (event) => {
+    if (event.sender !== window?.webContents) return null;
+    const result = await dialog.showSaveDialog(window, {
+      title: '导出诊断包', defaultPath: 'context-reader-diagnostics.json',
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    if (result.canceled || !result.filePath) return null;
+    const selectedPath = path.resolve(result.filePath);
+    grantedPaths.add(selectedPath);
+    return selectedPath;
+  });
+
   ipcMain.handle('reader:smoke-config', async (event) => {
     if (event.sender !== window?.webContents || !smokeFixture) {
       return null;
@@ -430,7 +523,9 @@ function registerIpc() {
         if (result.documentCount !== 1 || result.annotationCount !== 1
             || result.noteRevision !== 1 || result.noteMarkdown !== 'Renderer **autosaved** note'
             || result.selectedLineCount !== 1 || result.uiContract?.palette !== true
-            || result.uiContract?.island !== true || result.uiContract?.layout !== true) {
+            || result.uiContract?.island !== true || result.uiContract?.layout !== true
+            || result.tileContract?.canvasCount < 1 || result.tileContract?.minimum > 80
+            || result.tileContract?.maximum < 240) {
           throw new Error(`Unexpected renderer setup content: ${JSON.stringify(result)}`);
         }
       } else if (smokePhase === 'setup' && result.stage === 'closed') {
@@ -458,7 +553,9 @@ function registerIpc() {
       if (image.isEmpty() || bitmap.length === 0 || sampledBytes.size < 8) {
         throw new Error('Renderer screenshot is blank');
       }
-      const outputPath = path.join(projectRoot, 'build', 'renderer-p2-smoke.png');
+      const outputPath = process.env.CONTEXT_READER_SMOKE_OUTPUT
+        ? path.resolve(process.env.CONTEXT_READER_SMOKE_OUTPUT)
+        : path.join(projectRoot, 'build', 'renderer-p2-smoke.png');
       await fs.writeFile(outputPath, image.toPNG());
       if (smokePhase === 'recovery') {
         process.stdout.write(`Electron renderer P2 recovery smoke passed: ${outputPath}\n`);
@@ -493,7 +590,8 @@ async function createWindow() {
   window.removeMenu();
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', (event) => event.preventDefault());
-  await window.loadFile(rendererPath);
+  await window.loadURL('app://reader/index.html');
+  connectDataPort();
 }
 
 function focusMainWindow() {
@@ -518,6 +616,9 @@ if (!hasSingleInstanceLock) {
   });
 
   app.whenReady().then(async () => {
+    registerAppProtocol();
+    session.defaultSession.setPermissionCheckHandler(() => false);
+    session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
     registerIpc();
     startUtility();
     await createWindow();

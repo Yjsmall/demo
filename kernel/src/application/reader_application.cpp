@@ -31,7 +31,17 @@ ReaderApplication::~ReaderApplication() = default;
 RuntimeInfo ReaderApplication::runtime_info() const noexcept {
     return RuntimeInfo{
         .version = RuntimeVersion{.major = 0, .minor = 1, .patch = 0},
-        .application_api_version = 5,
+        .application_api_version = 6,
+        .build_id = CONTEXT_READER_BUILD_ID,
+        .capabilities = {
+            "raw-rgba-tiles",
+            "character-text-layout",
+            "point-text-selection",
+            "workspace-search",
+            "note-assets",
+            "readerpkg-v1",
+            "diagnostics-v1",
+        },
     };
 }
 
@@ -276,6 +286,67 @@ Result<PageText> ReaderApplication::extract_page_text(std::size_t page_index) {
 #endif
 }
 
+Result<RenderedTile> ReaderApplication::render_tile(
+    const TileRequest& request,
+    const CancellationToken& cancellation
+) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(cancellation.is_cancellation_requested()) {
+        return Result<RenderedTile>::failure(Error(ErrorCode::cancelled, "Tile render was cancelled"));
+    }
+    if(implementation_->document_session == nullptr) {
+        return Result<RenderedTile>::failure(Error(ErrorCode::not_found, "No document is open"));
+    }
+    auto rendered = implementation_->document_session->render_tile(request);
+    if(cancellation.is_cancellation_requested()) {
+        return Result<RenderedTile>::failure(Error(ErrorCode::cancelled, "Tile render was cancelled"));
+    }
+    return rendered;
+#else
+    static_cast<void>(request);
+    return Result<RenderedTile>::failure(
+        Error(ErrorCode::unsupported_document, "Tile rendering is not available")
+    );
+#endif
+}
+
+Result<PageTextLayout> ReaderApplication::page_text_layout(std::size_t page_index) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->document_session == nullptr) {
+        return Result<PageTextLayout>::failure(Error(ErrorCode::not_found, "No document is open"));
+    }
+    return implementation_->document_session->page_text_layout(page_index);
+#else
+    static_cast<void>(page_index);
+    return Result<PageTextLayout>::failure(
+        Error(ErrorCode::unsupported_document, "Structured text layout is not available")
+    );
+#endif
+}
+
+Result<TextSelection> ReaderApplication::select_text(
+    std::size_t page_index,
+    PagePoint start_point,
+    PagePoint end_point
+) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->document_session == nullptr) {
+        return Result<TextSelection>::failure(Error(ErrorCode::not_found, "No document is open"));
+    }
+    return implementation_->document_session->select_text(page_index, start_point, end_point);
+#else
+    static_cast<void>(page_index);
+    static_cast<void>(start_point);
+    static_cast<void>(end_point);
+    return Result<TextSelection>::failure(
+        Error(ErrorCode::unsupported_document, "Point selection is not available")
+    );
+#endif
+}
+
 Result<AnnotationRecord> ReaderApplication::create_annotation(const CreateAnnotation& command) {
     const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
@@ -356,6 +427,131 @@ Result<std::vector<NoteRecord>> ReaderApplication::list_notes(
     return Result<std::vector<NoteRecord>>::failure(
         Error(ErrorCode::unsupported_document, "Workspace support is not available")
     );
+#endif
+}
+
+Result<void> ReaderApplication::rebuild_search_index(const CancellationToken& cancellation) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->workspace == nullptr) {
+        return Result<void>::failure(Error(ErrorCode::not_found, "No workspace is open"));
+    }
+    return implementation_->workspace->rebuild_search_index(cancellation);
+#else
+    static_cast<void>(cancellation);
+    return Result<void>::failure(
+        Error(ErrorCode::unsupported_document, "Workspace search is not available")
+    );
+#endif
+}
+
+Result<SearchResponse> ReaderApplication::search(std::string_view query, std::size_t limit) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->workspace == nullptr) {
+        return Result<SearchResponse>::failure(Error(ErrorCode::not_found, "No workspace is open"));
+    }
+    return implementation_->workspace->search(query, limit);
+#else
+    static_cast<void>(query);
+    static_cast<void>(limit);
+    return Result<SearchResponse>::failure(
+        Error(ErrorCode::unsupported_document, "Workspace search is not available")
+    );
+#endif
+}
+
+Result<AssetRecord> ReaderApplication::import_note_asset(
+    AnnotationId annotation_id,
+    const std::filesystem::path& source,
+    const CancellationToken& cancellation
+) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->workspace == nullptr) {
+        return Result<AssetRecord>::failure(Error(ErrorCode::not_found, "No workspace is open"));
+    }
+    return implementation_->workspace->import_note_asset(annotation_id, source, cancellation);
+#else
+    static_cast<void>(annotation_id);
+    static_cast<void>(source);
+    static_cast<void>(cancellation);
+    return Result<AssetRecord>::failure(
+        Error(ErrorCode::unsupported_document, "Note assets are not available")
+    );
+#endif
+}
+
+Result<AssetData> ReaderApplication::read_asset(AssetId asset_id) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->workspace == nullptr) {
+        return Result<AssetData>::failure(Error(ErrorCode::not_found, "No workspace is open"));
+    }
+    return implementation_->workspace->read_asset(asset_id);
+#else
+    static_cast<void>(asset_id);
+    return Result<AssetData>::failure(
+        Error(ErrorCode::unsupported_document, "Note assets are not available")
+    );
+#endif
+}
+
+Result<BackupInspection> ReaderApplication::export_workspace(
+    const std::filesystem::path& destination,
+    const CancellationToken& cancellation
+) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->workspace == nullptr) {
+        return Result<BackupInspection>::failure(Error(ErrorCode::not_found, "No workspace is open"));
+    }
+    return implementation_->workspace->export_package(destination, cancellation);
+#else
+    static_cast<void>(destination);
+    static_cast<void>(cancellation);
+    return Result<BackupInspection>::failure(Error(ErrorCode::unsupported_document, "Workspace backup is not available"));
+#endif
+}
+
+Result<BackupInspection> ReaderApplication::inspect_backup(
+    const std::filesystem::path& package_path
+) {
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    return SqliteWorkspace::inspect_package(package_path);
+#else
+    static_cast<void>(package_path);
+    return Result<BackupInspection>::failure(Error(ErrorCode::unsupported_document, "Workspace backup is not available"));
+#endif
+}
+
+Result<WorkspaceInfo> ReaderApplication::restore_workspace(
+    const std::filesystem::path& package_path,
+    const std::filesystem::path& empty_target,
+    const CancellationToken& cancellation
+) {
+    const std::scoped_lock lock(implementation_->mutex);
+#if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
+    if(implementation_->workspace != nullptr) {
+        return Result<WorkspaceInfo>::failure(Error(ErrorCode::conflict, "Close the current workspace before restoring"));
+    }
+    if(cancellation.is_cancellation_requested()) {
+        return Result<WorkspaceInfo>::failure(Error(ErrorCode::cancelled, "Workspace restore was cancelled"));
+    }
+    auto restored = SqliteWorkspace::restore_package(package_path, empty_target);
+    if(!restored) return restored;
+    if(cancellation.is_cancellation_requested()) {
+        return Result<WorkspaceInfo>::failure(Error(ErrorCode::cancelled, "Workspace restore was cancelled"));
+    }
+    auto opened = SqliteWorkspace::open(empty_target, implementation_->pdf_engine);
+    if(!opened) return Result<WorkspaceInfo>::failure(opened.error());
+    implementation_->workspace = std::move(opened).value();
+    return Result<WorkspaceInfo>::success(implementation_->workspace->info());
+#else
+    static_cast<void>(package_path);
+    static_cast<void>(empty_target);
+    static_cast<void>(cancellation);
+    return Result<WorkspaceInfo>::failure(Error(ErrorCode::unsupported_document, "Workspace backup is not available"));
 #endif
 }
 

@@ -33,12 +33,22 @@ enum class Operation {
     close_document,
     page_info,
     render_page,
+    render_tile,
     extract_page_text,
+    page_text_layout,
+    select_text,
     create_annotation,
     list_annotations,
     delete_annotation,
     update_note,
     list_notes,
+    rebuild_search_index,
+    search,
+    import_note_asset,
+    read_asset,
+    export_workspace,
+    inspect_backup,
+    restore_workspace,
     verify_workspace,
 };
 
@@ -107,17 +117,27 @@ struct AddonContext final {
               {this, Operation::close_document},
               {this, Operation::page_info},
               {this, Operation::render_page},
+              {this, Operation::render_tile},
               {this, Operation::extract_page_text},
+              {this, Operation::page_text_layout},
+              {this, Operation::select_text},
               {this, Operation::create_annotation},
               {this, Operation::list_annotations},
               {this, Operation::delete_annotation},
               {this, Operation::update_note},
               {this, Operation::list_notes},
+              {this, Operation::rebuild_search_index},
+              {this, Operation::search},
+              {this, Operation::import_note_asset},
+              {this, Operation::read_asset},
+              {this, Operation::export_workspace},
+              {this, Operation::inspect_backup},
+              {this, Operation::restore_workspace},
               {this, Operation::verify_workspace},
           }} {}
 
     std::shared_ptr<RuntimeState> state;
-    std::array<FunctionData, 16> functions;
+    std::array<FunctionData, 26> functions;
 };
 
 using Payload = std::variant<
@@ -128,11 +148,18 @@ using Payload = std::variant<
     std::vector<DocumentRecord>,
     PageInfo,
     EncodedPageImage,
+    RenderedTile,
     PageText,
+    PageTextLayout,
+    TextSelection,
     AnnotationRecord,
     std::vector<AnnotationRecord>,
     NoteRecord,
     std::vector<NoteRecord>,
+    SearchResponse,
+    AssetRecord,
+    AssetData,
+    BackupInspection,
     WorkspaceVerification>;
 
 struct AsyncWork final {
@@ -141,13 +168,20 @@ struct AsyncWork final {
     std::shared_ptr<RuntimeState> state;
     Operation operation;
     std::filesystem::path path;
+    std::filesystem::path target_path;
     std::optional<DocumentId> document_id;
     std::optional<DocumentVersionId> document_version_id;
     std::optional<AnnotationId> annotation_id;
+    std::optional<AssetId> asset_id;
     std::optional<CreateAnnotation> annotation;
     std::optional<UpdateNote> note;
+    std::string search_query;
+    std::size_t search_limit = 50;
     std::size_t page_index = 0;
     double pixels_per_point = 1.0;
+    std::optional<TileRequest> tile_request;
+    PagePoint start_point{};
+    PagePoint end_point{};
     CancellationToken cancellation;
     std::optional<std::string> job_id;
     Payload payload;
@@ -307,6 +341,27 @@ napi_value rendered_page_value(napi_env env, const EncodedPageImage& rendered) {
     return result;
 }
 
+napi_value rendered_tile_value(napi_env env, const RenderedTile& rendered) {
+    napi_value result = nullptr;
+    napi_value rgba = nullptr;
+    void* copied_data = nullptr;
+    if(napi_create_object(env, &result) != napi_ok
+       || !set_number(env, result, "pageIndex", rendered.page_index)
+       || !set_number(env, result, "xPixels", rendered.x_pixels)
+       || !set_number(env, result, "yPixels", rendered.y_pixels)
+       || !set_number(env, result, "widthPixels", rendered.width_pixels)
+       || !set_number(env, result, "heightPixels", rendered.height_pixels)
+       || !set_double(env, result, "pixelsPerPoint", rendered.pixels_per_point)
+       || !set_number(env, result, "generation", rendered.generation)
+       || napi_create_arraybuffer(env, rendered.rgba.size(), &copied_data, &rgba) != napi_ok) {
+        return nullptr;
+    }
+    if(!rendered.rgba.empty()) {
+        std::copy(rendered.rgba.begin(), rendered.rgba.end(), static_cast<std::uint8_t*>(copied_data));
+    }
+    return set_property(env, result, "rgba", rgba) ? result : nullptr;
+}
+
 napi_value rect_value(napi_env env, const PageRect& bounds) {
     napi_value result = nullptr;
     if(napi_create_object(env, &result) != napi_ok
@@ -342,6 +397,114 @@ napi_value page_text_value(napi_env env, const PageText& page_text) {
         }
     }
     return set_property(env, result, "lines", lines) ? result : nullptr;
+}
+
+const char* direction_name(TextDirection direction) {
+    switch(direction) {
+        case TextDirection::left_to_right: return "ltr";
+        case TextDirection::right_to_left: return "rtl";
+        case TextDirection::top_to_bottom: return "ttb";
+    }
+    return "ltr";
+}
+
+napi_value point_value(napi_env env, PagePoint point) {
+    napi_value result = nullptr;
+    if(napi_create_object(env, &result) != napi_ok
+       || !set_double(env, result, "x", point.x)
+       || !set_double(env, result, "y", point.y)) {
+        return nullptr;
+    }
+    return result;
+}
+
+napi_value page_quad_value(napi_env env, const PageQuad& quad) {
+    napi_value result = nullptr;
+    const auto upper_left = point_value(env, quad.upper_left);
+    const auto upper_right = point_value(env, quad.upper_right);
+    const auto lower_left = point_value(env, quad.lower_left);
+    const auto lower_right = point_value(env, quad.lower_right);
+    if(upper_left == nullptr || upper_right == nullptr || lower_left == nullptr || lower_right == nullptr
+       || napi_create_object(env, &result) != napi_ok
+       || !set_property(env, result, "upperLeft", upper_left)
+       || !set_property(env, result, "upperRight", upper_right)
+       || !set_property(env, result, "lowerLeft", lower_left)
+       || !set_property(env, result, "lowerRight", lower_right)) {
+        return nullptr;
+    }
+    return result;
+}
+
+napi_value page_text_layout_value(napi_env env, const PageTextLayout& layout) {
+    napi_value result = nullptr;
+    napi_value units = nullptr;
+    napi_value lines = nullptr;
+    if(layout.units.size() > std::numeric_limits<std::uint32_t>::max()
+       || napi_create_object(env, &result) != napi_ok
+       || !set_number(env, result, "pageIndex", layout.page_index)
+       || !set_number(env, result, "layoutVersion", layout.layout_version)
+       || !set_string(env, result, "text", layout.text)
+       || napi_create_array_with_length(env, layout.units.size(), &units) != napi_ok
+       || napi_create_array_with_length(env, layout.lines.size(), &lines) != napi_ok) {
+        return nullptr;
+    }
+    for(std::size_t index = 0; index < layout.units.size(); ++index) {
+        const auto& source = layout.units[index];
+        napi_value unit = nullptr;
+        const auto quad = page_quad_value(env, source.quad);
+        if(quad == nullptr || napi_create_object(env, &unit) != napi_ok
+           || !set_number(env, unit, "logicalStart", source.logical_start)
+           || !set_number(env, unit, "logicalEnd", source.logical_end)
+           || !set_string(env, unit, "text", source.text)
+           || !set_string(env, unit, "direction", direction_name(source.direction))
+           || !set_number(env, unit, "lineIndex", source.line_index)
+           || !set_property(env, unit, "quad", quad)
+           || napi_set_element(env, units, static_cast<std::uint32_t>(index), unit) != napi_ok) {
+            return nullptr;
+        }
+    }
+    for(std::size_t index = 0; index < layout.lines.size(); ++index) {
+        napi_value line = nullptr;
+        const auto bounds = rect_value(env, layout.lines[index].bounds);
+        if(bounds == nullptr || napi_create_object(env, &line) != napi_ok
+           || !set_string(env, line, "text", layout.lines[index].text)
+           || !set_property(env, line, "bounds", bounds)
+           || !set_boolean(env, line, "vertical", layout.lines[index].vertical)
+           || napi_set_element(env, lines, static_cast<std::uint32_t>(index), line) != napi_ok) {
+            return nullptr;
+        }
+    }
+    return set_property(env, result, "units", units)
+        && set_property(env, result, "lines", lines) ? result : nullptr;
+}
+
+napi_value text_selection_value(napi_env env, const TextSelection& selection) {
+    napi_value result = nullptr;
+    napi_value quads = nullptr;
+    napi_value quote = nullptr;
+    if(selection.quads.size() > std::numeric_limits<std::uint32_t>::max()
+       || napi_create_object(env, &result) != napi_ok
+       || !set_number(env, result, "pageIndex", selection.page_index)
+       || !set_number(env, result, "layoutVersion", selection.layout_version)
+       || !set_number(env, result, "logicalStart", selection.logical_start)
+       || !set_number(env, result, "logicalEnd", selection.logical_end)
+       || !set_string(env, result, "direction", direction_name(selection.direction))
+       || !set_string(env, result, "text", selection.text)
+       || napi_create_array_with_length(env, selection.quads.size(), &quads) != napi_ok
+       || napi_create_object(env, &quote) != napi_ok
+       || !set_string(env, quote, "exact", selection.text)
+       || !set_string(env, quote, "prefix", selection.quote_prefix)
+       || !set_string(env, quote, "suffix", selection.quote_suffix)) {
+        return nullptr;
+    }
+    for(std::size_t index = 0; index < selection.quads.size(); ++index) {
+        const auto quad = page_quad_value(env, selection.quads[index]);
+        if(quad == nullptr || napi_set_element(env, quads, static_cast<std::uint32_t>(index), quad) != napi_ok) {
+            return nullptr;
+        }
+    }
+    return set_property(env, result, "quads", quads)
+        && set_property(env, result, "quote", quote) ? result : nullptr;
 }
 
 napi_value verification_value(napi_env env, const WorkspaceVerification& check) {
@@ -389,6 +552,8 @@ napi_value annotation_value(napi_env env, const AnnotationRecord& annotation) {
        || !set_number(env, result, "pageIndex", annotation.page_index)
        || !set_string(env, result, "layoutVersion", annotation.layout_version)
        || !set_string(env, result, "color", color_name(annotation.color))
+       || !set_number(env, result, "anchorVersion", annotation.anchor_version)
+       || !set_string(env, result, "direction", annotation.direction)
        || napi_create_array_with_length(env, annotation.quads.size(), &quads) != napi_ok
        || napi_create_object(env, &quote) != napi_ok
        || !set_string(env, quote, "exact", annotation.quote.exact)
@@ -397,6 +562,8 @@ napi_value annotation_value(napi_env env, const AnnotationRecord& annotation) {
        || !set_property(env, result, "quote", quote)) {
         return nullptr;
     }
+    if(annotation.text_start && !set_number(env, result, "textStart", *annotation.text_start)) return nullptr;
+    if(annotation.text_end && !set_number(env, result, "textEnd", *annotation.text_end)) return nullptr;
     for(std::size_t index = 0; index < annotation.quads.size(); ++index) {
         const auto quad = rect_value(env, annotation.quads[index]);
         if(quad == nullptr || napi_set_element(env, quads, static_cast<std::uint32_t>(index), quad) != napi_ok) {
@@ -448,6 +615,87 @@ napi_value notes_value(napi_env env, const std::vector<NoteRecord>& notes) {
     return result;
 }
 
+napi_value search_value(napi_env env, const SearchResponse& response) {
+    napi_value result = nullptr;
+    napi_value entries = nullptr;
+    if(response.results.size() > std::numeric_limits<std::uint32_t>::max()
+       || napi_create_object(env, &result) != napi_ok
+       || !set_string(env, result, "indexStatus", response.index_status)
+       || napi_create_array_with_length(env, response.results.size(), &entries) != napi_ok) {
+        return nullptr;
+    }
+    for(std::size_t index = 0; index < response.results.size(); ++index) {
+        const auto& source = response.results[index];
+        napi_value entry = nullptr;
+        if(napi_create_object(env, &entry) != napi_ok
+           || !set_string(env, entry, "kind", source.kind == SearchResultKind::note ? "note" : "pdfPage")
+           || !set_string(env, entry, "documentVersionId", stable_id_to_hex(source.document_version_id))
+           || !set_string(env, entry, "title", source.title)
+           || !set_string(env, entry, "excerpt", source.excerpt)) {
+            return nullptr;
+        }
+        if(source.note_id && !set_string(env, entry, "noteId", stable_id_to_hex(*source.note_id))) {
+            return nullptr;
+        }
+        if(source.page_index && !set_number(env, entry, "pageIndex", *source.page_index)) {
+            return nullptr;
+        }
+        if(napi_set_element(env, entries, static_cast<std::uint32_t>(index), entry) != napi_ok) {
+            return nullptr;
+        }
+    }
+    return set_property(env, result, "results", entries) ? result : nullptr;
+}
+
+napi_value asset_record_value(napi_env env, const AssetRecord& asset) {
+    napi_value result = nullptr;
+    if(napi_create_object(env, &result) != napi_ok
+       || !set_string(env, result, "id", stable_id_to_hex(asset.id))
+       || !set_string(env, result, "contentSha256", asset.content_sha256)
+       || !set_string(env, result, "mediaType", asset.media_type)
+       || !set_number(env, result, "byteLength", asset.byte_length)
+       || !set_number(env, result, "width", asset.width)
+       || !set_number(env, result, "height", asset.height)) {
+        return nullptr;
+    }
+    return result;
+}
+
+napi_value asset_data_value(napi_env env, const AssetData& data) {
+    napi_value result = nullptr;
+    napi_value bytes = nullptr;
+    void* copied_data = nullptr;
+    const auto asset = asset_record_value(env, data.asset);
+    if(asset == nullptr || napi_create_object(env, &result) != napi_ok
+       || napi_create_arraybuffer(env, data.bytes.size(), &copied_data, &bytes) != napi_ok) {
+        return nullptr;
+    }
+    if(!data.bytes.empty()) {
+        std::copy(data.bytes.begin(), data.bytes.end(), static_cast<std::uint8_t*>(copied_data));
+    }
+    return set_property(env, result, "asset", asset)
+        && set_property(env, result, "bytes", bytes) ? result : nullptr;
+}
+
+napi_value backup_inspection_value(napi_env env, const BackupInspection& inspection) {
+    napi_value result = nullptr;
+    napi_value issues = nullptr;
+    if(napi_create_object(env, &result) != napi_ok
+       || !set_boolean(env, result, "valid", inspection.valid)
+       || !set_number(env, result, "formatVersion", inspection.format_version)
+       || !set_number(env, result, "fileCount", inspection.file_count)
+       || !set_number(env, result, "totalUncompressedBytes", inspection.total_uncompressed_bytes)
+       || napi_create_array_with_length(env, inspection.issues.size(), &issues) != napi_ok) {
+        return nullptr;
+    }
+    for(std::size_t index = 0; index < inspection.issues.size(); ++index) {
+        napi_value issue = nullptr;
+        if(!make_string(env, inspection.issues[index], &issue)
+           || napi_set_element(env, issues, static_cast<std::uint32_t>(index), issue) != napi_ok) return nullptr;
+    }
+    return set_property(env, result, "issues", issues) ? result : nullptr;
+}
+
 template <typename T>
 void store(Result<T> result, AsyncWork& work) {
     if(result) {
@@ -492,8 +740,17 @@ void execute(napi_env, void* data) {
                     work
                 );
                 break;
+            case Operation::render_tile:
+                store(app.render_tile(*work.tile_request, work.cancellation), work);
+                break;
             case Operation::extract_page_text:
                 store(app.extract_page_text(work.page_index), work);
+                break;
+            case Operation::page_text_layout:
+                store(app.page_text_layout(work.page_index), work);
+                break;
+            case Operation::select_text:
+                store(app.select_text(work.page_index, work.start_point, work.end_point), work);
                 break;
             case Operation::create_annotation: store(app.create_annotation(*work.annotation), work); break;
             case Operation::list_annotations:
@@ -502,6 +759,27 @@ void execute(napi_env, void* data) {
             case Operation::delete_annotation: store(app.delete_annotation(*work.annotation_id), work); break;
             case Operation::update_note: store(app.update_note(*work.note), work); break;
             case Operation::list_notes: store(app.list_notes(*work.document_version_id), work); break;
+            case Operation::rebuild_search_index:
+                store(app.rebuild_search_index(work.cancellation), work);
+                break;
+            case Operation::search:
+                store(app.search(work.search_query, work.search_limit), work);
+                break;
+            case Operation::import_note_asset:
+                store(app.import_note_asset(*work.annotation_id, work.path, work.cancellation), work);
+                break;
+            case Operation::read_asset:
+                store(app.read_asset(*work.asset_id), work);
+                break;
+            case Operation::export_workspace:
+                store(app.export_workspace(work.path, work.cancellation), work);
+                break;
+            case Operation::inspect_backup:
+                store(app.inspect_backup(work.path), work);
+                break;
+            case Operation::restore_workspace:
+                store(app.restore_workspace(work.path, work.target_path, work.cancellation), work);
+                break;
             case Operation::verify_workspace: store(app.verify_workspace(), work); break;
         }
     } catch(const std::exception& exception) {
@@ -530,8 +808,14 @@ napi_value payload_value(napi_env env, const Payload& payload) {
                 return page_info_value(env, value);
             } else if constexpr(std::is_same_v<T, EncodedPageImage>) {
                 return rendered_page_value(env, value);
+            } else if constexpr(std::is_same_v<T, RenderedTile>) {
+                return rendered_tile_value(env, value);
             } else if constexpr(std::is_same_v<T, PageText>) {
                 return page_text_value(env, value);
+            } else if constexpr(std::is_same_v<T, PageTextLayout>) {
+                return page_text_layout_value(env, value);
+            } else if constexpr(std::is_same_v<T, TextSelection>) {
+                return text_selection_value(env, value);
             } else if constexpr(std::is_same_v<T, AnnotationRecord>) {
                 return annotation_value(env, value);
             } else if constexpr(std::is_same_v<T, std::vector<AnnotationRecord>>) {
@@ -540,6 +824,14 @@ napi_value payload_value(napi_env env, const Payload& payload) {
                 return note_value(env, value);
             } else if constexpr(std::is_same_v<T, std::vector<NoteRecord>>) {
                 return notes_value(env, value);
+            } else if constexpr(std::is_same_v<T, SearchResponse>) {
+                return search_value(env, value);
+            } else if constexpr(std::is_same_v<T, AssetRecord>) {
+                return asset_record_value(env, value);
+            } else if constexpr(std::is_same_v<T, AssetData>) {
+                return asset_data_value(env, value);
+            } else if constexpr(std::is_same_v<T, BackupInspection>) {
+                return backup_inspection_value(env, value);
             } else {
                 return verification_value(env, value);
             }
@@ -694,6 +986,51 @@ std::optional<double> number_property(
     return property ? number_argument(env, *property, message) : std::nullopt;
 }
 
+std::optional<std::size_t> size_property(
+    napi_env env,
+    napi_value object,
+    const char* name,
+    const char* message
+) {
+    const auto property = named_property(env, object, name, message);
+    return property ? page_index_argument(env, *property) : std::nullopt;
+}
+
+std::optional<PagePoint> point_argument(napi_env env, napi_value argument, const char* message) {
+    const auto x = number_property(env, argument, "x", message);
+    const auto y = number_property(env, argument, "y", message);
+    if(!x || !y || !std::isfinite(*x) || !std::isfinite(*y)) {
+        if(x && y) napi_throw_range_error(env, "INVALID_ARGUMENT", message);
+        return std::nullopt;
+    }
+    return PagePoint{.x = *x, .y = *y};
+}
+
+std::optional<TileRequest> tile_request_argument(napi_env env, napi_value argument) {
+    const auto page_index = size_property(env, argument, "pageIndex", "Tile pageIndex must be a non-negative integer");
+    const auto scale = number_property(env, argument, "pixelsPerPoint", "Tile pixelsPerPoint must be a number");
+    const auto x = size_property(env, argument, "xPixels", "Tile xPixels must be a non-negative integer");
+    const auto y = size_property(env, argument, "yPixels", "Tile yPixels must be a non-negative integer");
+    const auto width = size_property(env, argument, "widthPixels", "Tile widthPixels must be a positive integer");
+    const auto height = size_property(env, argument, "heightPixels", "Tile heightPixels must be a positive integer");
+    const auto generation = size_property(env, argument, "generation", "Tile generation must be a non-negative integer");
+    if(!page_index || !scale || !x || !y || !width || !height || !generation) return std::nullopt;
+    if(!std::isfinite(*scale) || *scale <= 0.0 || *scale > 16.0
+       || *width == 0 || *height == 0 || *width > 512 || *height > 512) {
+        napi_throw_range_error(env, "INVALID_ARGUMENT", "Tile dimensions or scale are outside the supported range");
+        return std::nullopt;
+    }
+    return TileRequest{
+        .page_index = *page_index,
+        .pixels_per_point = *scale,
+        .x_pixels = *x,
+        .y_pixels = *y,
+        .width_pixels = *width,
+        .height_pixels = *height,
+        .generation = *generation,
+    };
+}
+
 std::optional<CreateAnnotation> annotation_argument(napi_env env, napi_value argument) {
     const auto version_id = id_property<DocumentVersionIdTag>(
         env, argument, "documentVersionId", "Document version ID must be 32 hexadecimal characters"
@@ -747,7 +1084,7 @@ std::optional<CreateAnnotation> annotation_argument(napi_env env, napi_value arg
         if(!x || !y || !width || !height) return std::nullopt;
         quads.push_back(PageRect{.x = *x, .y = *y, .width = *width, .height = *height});
     }
-    return CreateAnnotation{
+    CreateAnnotation command{
         .document_version_id = *version_id,
         .page_index = *page_index,
         .quads = std::move(quads),
@@ -755,6 +1092,30 @@ std::optional<CreateAnnotation> annotation_argument(napi_env env, napi_value arg
         .layout_version = *layout_version,
         .color = color,
     };
+    bool anchor_present = false;
+    if(napi_has_named_property(env, argument, "anchorVersion", &anchor_present) != napi_ok) {
+        napi_throw_type_error(env, "INVALID_ARGUMENT", "Annotation anchorVersion could not be read");
+        return std::nullopt;
+    }
+    if(anchor_present) {
+        const auto anchor_version = number_property(env, argument, "anchorVersion", "Annotation anchorVersion must be 2");
+        const auto text_start = size_property(env, argument, "textStart", "Annotation textStart must be a non-negative integer");
+        const auto text_end = size_property(env, argument, "textEnd", "Annotation textEnd must be a positive integer");
+        const auto direction = string_property(env, argument, "direction", "Annotation direction must be a string");
+        if(!anchor_version || *anchor_version != 2.0 || !text_start || !text_end || !direction
+           || *text_end <= *text_start
+           || (*direction != "ltr" && *direction != "rtl" && *direction != "ttb")) {
+            if(anchor_version && text_start && text_end && direction) {
+                napi_throw_range_error(env, "INVALID_ARGUMENT", "Character annotation anchor is invalid");
+            }
+            return std::nullopt;
+        }
+        command.anchor_version = 2;
+        command.text_start = *text_start;
+        command.text_end = *text_end;
+        command.direction = *direction;
+    }
+    return command;
 }
 
 std::optional<UpdateNote> note_argument(napi_env env, napi_value argument) {
@@ -923,8 +1284,100 @@ napi_value schedule(napi_env env, napi_callback_info info) {
             if(!work->note) return nullptr;
             break;
         }
+        case Operation::rebuild_search_index: {
+            if(count > 1U) {
+                napi_throw_type_error(env, "INVALID_ARGUMENT", "Expected an optional Job ID");
+                return nullptr;
+            }
+            if(count == 1U) {
+                work->job_id = string_argument(env, arguments[0], "Job ID must be a non-empty string");
+                if(!work->job_id || work->job_id->empty()) return nullptr;
+            }
+            break;
+        }
+        case Operation::search: {
+            if(!expect_count(1, "Expected one search request")) return nullptr;
+            const auto query = string_property(env, arguments[0], "query", "Search query must be a string");
+            const auto limit = size_property(env, arguments[0], "limit", "Search limit must be a positive integer");
+            if(!query || !limit || query->empty() || *limit == 0 || *limit > 200) {
+                if(query && limit) napi_throw_range_error(env, "INVALID_ARGUMENT", "Search query or limit is outside the supported range");
+                return nullptr;
+            }
+            work->search_query = *query;
+            work->search_limit = *limit;
+            break;
+        }
+        case Operation::import_note_asset: {
+            if(count != 2U && count != 3U) {
+                napi_throw_type_error(env, "INVALID_ARGUMENT", "Expected annotation ID, asset path and optional Job ID");
+                return nullptr;
+            }
+            const auto annotation = string_argument(env, arguments[0], "Annotation ID must be a hexadecimal string");
+            const auto source = string_argument(env, arguments[1], "Asset path must be a string");
+            if(!annotation || !source) return nullptr;
+            work->annotation_id = stable_id_from_hex<AnnotationIdTag>(*annotation);
+            if(!work->annotation_id) {
+                napi_throw_range_error(env, "INVALID_ARGUMENT", "Annotation ID must contain exactly 32 hexadecimal characters");
+                return nullptr;
+            }
+            work->path = utf8_path(*source);
+            if(count == 3U) {
+                work->job_id = string_argument(env, arguments[2], "Job ID must be a non-empty string");
+                if(!work->job_id || work->job_id->empty()) return nullptr;
+            }
+            break;
+        }
+        case Operation::read_asset: {
+            if(!expect_count(1, "Expected one Asset ID")) return nullptr;
+            const auto asset = string_argument(env, arguments[0], "Asset ID must be a hexadecimal string");
+            if(!asset) return nullptr;
+            work->asset_id = stable_id_from_hex<AssetIdTag>(*asset);
+            if(!work->asset_id) {
+                napi_throw_range_error(env, "INVALID_ARGUMENT", "Asset ID must contain exactly 32 hexadecimal characters");
+                return nullptr;
+            }
+            break;
+        }
+        case Operation::export_workspace: {
+            if(count != 1U && count != 2U) {
+                napi_throw_type_error(env, "INVALID_ARGUMENT", "Expected backup destination and optional Job ID");
+                return nullptr;
+            }
+            const auto destination = string_argument(env, arguments[0], "Backup destination must be a string");
+            if(!destination) return nullptr;
+            work->path = utf8_path(*destination);
+            if(count == 2U) {
+                work->job_id = string_argument(env, arguments[1], "Job ID must be a non-empty string");
+                if(!work->job_id || work->job_id->empty()) return nullptr;
+            }
+            break;
+        }
+        case Operation::inspect_backup: {
+            if(!expect_count(1, "Expected one backup path")) return nullptr;
+            const auto package_path = string_argument(env, arguments[0], "Backup path must be a string");
+            if(!package_path) return nullptr;
+            work->path = utf8_path(*package_path);
+            break;
+        }
+        case Operation::restore_workspace: {
+            if(count != 2U && count != 3U) {
+                napi_throw_type_error(env, "INVALID_ARGUMENT", "Expected backup path, empty target and optional Job ID");
+                return nullptr;
+            }
+            const auto package_path = string_argument(env, arguments[0], "Backup path must be a string");
+            const auto target = string_argument(env, arguments[1], "Restore target must be a string");
+            if(!package_path || !target) return nullptr;
+            work->path = utf8_path(*package_path);
+            work->target_path = utf8_path(*target);
+            if(count == 3U) {
+                work->job_id = string_argument(env, arguments[2], "Job ID must be a non-empty string");
+                if(!work->job_id || work->job_id->empty()) return nullptr;
+            }
+            break;
+        }
         case Operation::page_info:
-        case Operation::extract_page_text: {
+        case Operation::extract_page_text:
+        case Operation::page_text_layout: {
             if(!expect_count(1, "Expected one page index argument")) {
                 return nullptr;
             }
@@ -970,6 +1423,30 @@ napi_value schedule(napi_env env, napi_callback_info info) {
                 );
                 if(!work->job_id || work->job_id->empty()) return nullptr;
             }
+            break;
+        }
+        case Operation::render_tile: {
+            if(count != 1U && count != 2U) {
+                napi_throw_type_error(env, "INVALID_ARGUMENT", "Expected a Tile request and optional Job ID");
+                return nullptr;
+            }
+            work->tile_request = tile_request_argument(env, arguments[0]);
+            if(!work->tile_request) return nullptr;
+            if(count == 2U) {
+                work->job_id = string_argument(env, arguments[1], "Job ID must be a non-empty string");
+                if(!work->job_id || work->job_id->empty()) return nullptr;
+            }
+            break;
+        }
+        case Operation::select_text: {
+            if(!expect_count(3, "Expected page index, start point and end point")) return nullptr;
+            const auto page_index = page_index_argument(env, arguments[0]);
+            const auto start = point_argument(env, arguments[1], "Selection start point must contain finite x and y");
+            const auto end = point_argument(env, arguments[2], "Selection end point must contain finite x and y");
+            if(!page_index || !start || !end) return nullptr;
+            work->page_index = *page_index;
+            work->start_point = *start;
+            work->end_point = *end;
             break;
         }
         case Operation::close_workspace:
@@ -1066,7 +1543,16 @@ Napi::Value runtime_info(const Napi::CallbackInfo& info) {
             "applicationApiVersion",
             Napi::Number::New(env, runtime.application_api_version)
         );
+        result.Set("buildId", Napi::String::New(env, runtime.build_id));
         result.Set("bindingNapiVersion", Napi::Number::New(env, NAPI_VERSION));
+        auto capabilities = Napi::Array::New(env, runtime.capabilities.size());
+        for(std::size_t index = 0; index < runtime.capabilities.size(); ++index) {
+            capabilities.Set(
+                static_cast<std::uint32_t>(index),
+                Napi::String::New(env, runtime.capabilities[index])
+            );
+        }
+        result.Set("capabilities", capabilities);
         return result;
     } catch(const std::exception& exception) {
         Napi::Error::New(env, exception.what()).ThrowAsJavaScriptException();
@@ -1103,7 +1589,7 @@ Napi::Object initialize(Napi::Env env, Napi::Object exports) {
     auto context = std::make_unique<AddonContext>(
         std::make_shared<RuntimeState>(std::move(runtime).value())
     );
-    constexpr std::array<const char*, 16> names{
+    constexpr std::array<const char*, 26> names{
         "createWorkspace",
         "openWorkspace",
         "closeWorkspace",
@@ -1113,12 +1599,22 @@ Napi::Object initialize(Napi::Env env, Napi::Object exports) {
         "closeDocument",
         "pageInfo",
         "renderPage",
+        "renderTile",
         "extractPageText",
+        "pageTextLayout",
+        "selectText",
         "createAnnotation",
         "listAnnotations",
         "deleteAnnotation",
         "updateNote",
         "listNotes",
+        "rebuildSearchIndex",
+        "search",
+        "importNoteAsset",
+        "readAsset",
+        "exportWorkspace",
+        "inspectBackup",
+        "restoreWorkspace",
         "verifyWorkspace",
     };
     exports.Set(

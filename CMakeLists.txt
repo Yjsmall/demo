@@ -25,6 +25,41 @@ option(CONTEXT_READER_BUILD_NODE "Build the Node-API binding" OFF)
 option(CONTEXT_READER_BUILD_TOOLS "Build Context Reader engineering tools" OFF)
 option(CONTEXT_READER_ENABLE_MUPDF "Build the MuPDF adapter" OFF)
 option(CONTEXT_READER_ENABLE_WORKSPACE "Build the SQLite workspace adapter" OFF)
+set(CONTEXT_READER_BUILD_ID "" CACHE STRING "Build ID embedded in runtime artifacts")
+if(CONTEXT_READER_BUILD_ID STREQUAL "" OR CONTEXT_READER_BUILD_ID STREQUAL "dev")
+    execute_process(
+        COMMAND git rev-parse HEAD
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        OUTPUT_VARIABLE _context_reader_git_commit
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(_context_reader_git_commit STREQUAL "")
+        set(_context_reader_git_commit "unknown")
+    endif()
+    file(SHA256 "${CMAKE_SOURCE_DIR}/package-lock.json" _context_reader_lock_hash)
+    set(_context_reader_ci_run_id "$ENV{GITHUB_RUN_ID}")
+    if(_context_reader_ci_run_id STREQUAL "")
+        set(_context_reader_ci_run_id "$ENV{CI_RUN_ID}")
+    endif()
+    if(_context_reader_ci_run_id STREQUAL "")
+        set(_context_reader_ci_run_id "local")
+    endif()
+    string(
+        SHA256 _context_reader_build_hash
+        "${_context_reader_git_commit}|${_context_reader_lock_hash}|win32-x64|${_context_reader_ci_run_id}"
+    )
+    string(SUBSTRING "${_context_reader_build_hash}" 0 20 _context_reader_build_hash_short)
+    set(
+        CONTEXT_READER_BUILD_ID
+        "cr-${_context_reader_build_hash_short}"
+        CACHE STRING
+        "Build ID embedded in runtime artifacts"
+        FORCE
+    )
+    file(MAKE_DIRECTORY "${CMAKE_SOURCE_DIR}/build")
+    file(WRITE "${CMAKE_SOURCE_DIR}/build/build-id.txt" "${CONTEXT_READER_BUILD_ID}\n")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,6 +77,7 @@ endif()
 if(CONTEXT_READER_ENABLE_WORKSPACE)
     enable_language(C)
     include(Sqlite)
+    include(Miniz)
 endif()
 
 add_subdirectory(kernel)
@@ -65,7 +101,7 @@ if(CONTEXT_READER_ENABLE_MUPDF)
     list(APPEND _context_reader_core_allowed_targets MuPDF::MuPDF)
 endif()
 if(CONTEXT_READER_ENABLE_WORKSPACE)
-    list(APPEND _context_reader_core_allowed_targets SQLite::SQLite3 bcrypt)
+    list(APPEND _context_reader_core_allowed_targets SQLite::SQLite3 Miniz::Miniz bcrypt ole32 windowscodecs)
 endif()
 context_reader_assert_target_links_only(reader_core ${_context_reader_core_allowed_targets})
 unset(_context_reader_core_allowed_targets)
@@ -100,6 +136,10 @@ endif()
 
 if(TARGET reader-facade-contract)
     context_reader_assert_target_links_only(reader-facade-contract reader_core)
+endif()
+
+if(TARGET reader-bench)
+    context_reader_assert_target_links_only(reader-bench reader_core psapi)
 endif()
 
 if(TARGET sqlite_workspace_test)

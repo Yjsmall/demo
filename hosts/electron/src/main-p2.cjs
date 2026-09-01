@@ -61,7 +61,7 @@ function runUtility(script, args, expectedExitCode = null) {
 function validateNormalSmoke(message) {
   return message?.status === 'ok'
     && message.processType === 'utility'
-    && message.runtimeInfo?.applicationApiVersion === 5
+    && message.runtimeInfo?.applicationApiVersion === 6
     && message.workspaceId === message.reopenedWorkspaceId
     && message.documentCount === 1
     && message.verification?.valid === true

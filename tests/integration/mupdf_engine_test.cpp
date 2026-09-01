@@ -2,12 +2,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
+#include "context_reader/pdf/document_session.hpp"
 #include "context_reader/pdf/mupdf_engine.hpp"
 #include "context_reader/pdf/pdf_engine.hpp"
 #include "context_reader/shared/error.hpp"
@@ -87,6 +90,34 @@ int main() {
             );
         }
 
+        const auto tile = document->render_tile(TileRequest{
+            .page_index = 0U,
+            .pixels_per_point = 1.0,
+            .x_pixels = 0U,
+            .y_pixels = 0U,
+            .width_pixels = 128U,
+            .height_pixels = 128U,
+            .generation = 7U,
+        });
+        check(tile.has_value(), "MuPDF renders a bounded RGBA tile");
+        if(tile) {
+            check(tile.value().rgba.size() == 128U * 128U * 4U, "tile is tightly packed RGBA8");
+            check(tile.value().generation == 7U, "tile preserves its generation");
+        }
+        const auto oversized_tile = document->render_tile(TileRequest{
+            .page_index = 0U,
+            .pixels_per_point = 1.0,
+            .x_pixels = 0U,
+            .y_pixels = 0U,
+            .width_pixels = 513U,
+            .height_pixels = 1U,
+            .generation = 0U,
+        });
+        check(!oversized_tile.has_value(), "oversized tile is rejected");
+        if(!oversized_tile) {
+            check(oversized_tile.error().code() == ErrorCode::invalid_argument, "tile limit uses a stable error");
+        }
+
         const auto extracted = document->extract_text(0U);
         check(extracted.has_value(), "MuPDF extracts structured text");
         if(extracted) {
@@ -108,6 +139,29 @@ int main() {
             }
         }
 
+        const auto layout = document->page_text_layout(0U);
+        check(layout.has_value(), "MuPDF returns character selection layout");
+        if(layout && layout.value().units.size() >= 7U) {
+            const auto center = [](const PageQuad& quad) {
+                return PagePoint{
+                    (quad.upper_left.x + quad.upper_right.x + quad.lower_left.x + quad.lower_right.x) / 4.0,
+                    (quad.upper_left.y + quad.upper_right.y + quad.lower_left.y + quad.lower_right.y) / 4.0,
+                };
+            };
+            const auto selected = document->select_text(
+                0U,
+                center(layout.value().units[0].quad),
+                center(layout.value().units[6].quad)
+            );
+            check(selected.has_value(), "point selection returns a canonical character range");
+            if(selected) {
+                check(selected.value().text == "Context", "partial-line selection is character precise");
+                check(selected.value().logical_start == 0U && selected.value().logical_end == 7U,
+                      "selection returns logical offsets");
+                check(selected.value().quads.size() == 7U, "selection returns one quad per selected unit");
+            }
+        }
+
         const auto missing_page = document->page_info(1U);
         check(!missing_page.has_value(), "out-of-range page is rejected");
         if(!missing_page) {
@@ -115,6 +169,38 @@ int main() {
                 missing_page.error().code() == ErrorCode::not_found,
                 "out-of-range page has stable error code"
             );
+        }
+    }
+
+
+    auto session_result = DocumentSession::open(
+        engine,
+        corpus_root / "generated" / "basic-rotated-cropbox.pdf"
+    );
+    check(session_result.has_value(), "DocumentSession opens for parallel display-list rendering");
+    if(session_result) {
+        auto session = std::move(session_result).value();
+        std::vector<std::future<Result<RenderedTile>>> renders;
+        for(std::size_t index = 0; index < 8U; ++index) {
+            renders.push_back(std::async(std::launch::async, [&session, index] {
+                return session->render_tile(TileRequest{
+                    .page_index = 0U,
+                    .pixels_per_point = 1.0,
+                    .x_pixels = (index % 2U) * 128U,
+                    .y_pixels = ((index / 2U) % 2U) * 128U,
+                    .width_pixels = 128U,
+                    .height_pixels = 128U,
+                    .generation = index + 1U,
+                });
+            }));
+        }
+        for(std::size_t index = 0; index < renders.size(); ++index) {
+            const auto rendered = renders[index].get();
+            check(rendered.has_value(), "clone-context tile worker renders concurrently");
+            if(rendered) {
+                check(rendered.value().generation == index + 1U, "parallel tile keeps request generation");
+                check(rendered.value().rgba.size() == 128U * 128U * 4U, "parallel tile has bounded RGBA data");
+            }
         }
     }
 
@@ -150,6 +236,35 @@ int main() {
                 "double-column fixture has deterministic reading order"
             );
             check(extracted.value().lines.size() == 4U, "double-column fixture has four lines");
+        }
+    }
+
+    auto complex = engine.open(corpus_root / "generated" / "selection-complex.pdf");
+    check(complex.has_value(), "generated selection layout PDF opens through MuPDF");
+    if(complex) {
+        auto document = std::move(complex).value();
+        const auto layout = document->page_text_layout(0U);
+        check(layout.has_value(), "complex selection fixture returns character layout");
+        if(layout) {
+            const auto has_ligature = std::any_of(
+                layout.value().units.begin(),
+                layout.value().units.end(),
+                [](const TextSelectionUnit& unit) { return unit.text == "\xEF\xAC\x81"; }
+            ) || layout.value().text.find("fi") != std::string::npos;
+            const auto has_rtl = std::any_of(
+                layout.value().units.begin(),
+                layout.value().units.end(),
+                [](const TextSelectionUnit& unit) { return unit.direction == TextDirection::right_to_left; }
+            );
+            const auto has_vertical = std::any_of(
+                layout.value().units.begin(),
+                layout.value().units.end(),
+                [](const TextSelectionUnit& unit) { return unit.direction == TextDirection::top_to_bottom; }
+            );
+            check(layout.value().lines.size() >= 4U, "fixture covers partial and cross-line layout");
+            check(has_ligature, "ToUnicode preserves or canonically expands a ligature");
+            check(has_rtl, "Unicode bidi metadata marks RTL selection units");
+            check(has_vertical, "Identity-V metadata marks vertical selection units");
         }
     }
 

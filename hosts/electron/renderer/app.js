@@ -1,12 +1,12 @@
 const api = window.contextReader;
 
 const elements = Object.fromEntries([
-  'create-workspace', 'open-workspace', 'import-pdf', 'status', 'document-count',
+  'create-workspace', 'open-workspace', 'export-workspace', 'restore-workspace', 'export-diagnostics', 'import-pdf', 'status', 'document-count',
   'document-list', 'previous-page', 'next-page', 'page-indicator', 'zoom-out',
   'zoom-in', 'zoom-value', 'highlight-selection', 'reader-scroll', 'empty-state',
-  'page-stage', 'page-image', 'annotation-layer', 'text-layer', 'selected-quote',
+  'pages-container', 'selected-quote',
   'note-source', 'note-revision', 'save-note', 'delete-annotation',
-  'cancel-job',
+  'cancel-job', 'note-edit-tab', 'note-preview-tab', 'note-preview', 'insert-note-asset',
 ].map((id) => [id, document.getElementById(id)]));
 
 const state = {
@@ -14,24 +14,35 @@ const state = {
   documents: [],
   document: null,
   pageIndex: 0,
-  pageInfo: null,
-  pageText: null,
+  pageInfos: [],
+  pageViews: new Map(),
   annotations: [],
   notes: [],
   selectedAnnotationId: null,
-  selectedLines: [],
-  selectionText: '',
+  pendingSelection: null,
   highlightColor: 'yellow',
   zoom: 1,
-  imageUrl: null,
+  generation: 0,
+  tileJobs: new Map(),
+  tileQueue: [],
+  activeTileCount: 0,
+  tileCache: new Map(),
+  tileCacheBytes: 0,
+  pageObserver: null,
+  scrollRenderTimer: null,
+  devicePixelRatio: window.devicePixelRatio || 1,
   busy: false,
   activeJob: null,
   noteDirty: false,
   noteAutosaveTimer: null,
   noteSavingPromise: null,
+  noteMode: 'edit',
 };
 
 const noteAutosaveDelayMs = 350;
+const tileEdge = 512;
+const maximumConcurrentTiles = 8;
+const tileCacheBudgetBytes = 256 * 1024 * 1024;
 
 function setStatus(message, isError = false) {
   elements.status.textContent = message;
@@ -80,16 +91,20 @@ function updateControls() {
   const hasWorkspace = Boolean(state.workspace);
   const hasDocument = Boolean(state.document);
   elements['import-pdf'].disabled = !hasWorkspace || state.busy;
+  elements['export-workspace'].disabled = !hasWorkspace || state.busy;
+  elements['restore-workspace'].disabled = state.busy;
+  elements['export-diagnostics'].disabled = state.busy;
   elements['previous-page'].disabled = !hasDocument || state.pageIndex === 0 || state.busy;
   elements['next-page'].disabled = !hasDocument
     || state.pageIndex + 1 >= state.document.pageCount || state.busy;
   elements['zoom-out'].disabled = !hasDocument || state.zoom <= 0.5 || state.busy;
   elements['zoom-in'].disabled = !hasDocument || state.zoom >= 3 || state.busy;
-  elements['highlight-selection'].disabled = state.selectedLines.length === 0 || state.busy;
+  elements['highlight-selection'].disabled = !state.pendingSelection || state.busy;
   const selected = selectedAnnotation();
   elements['note-source'].disabled = !selected || state.busy;
   elements['save-note'].disabled = !selected || state.busy;
   elements['delete-annotation'].disabled = !selected || state.busy;
+  elements['insert-note-asset'].disabled = !selected || state.busy;
   elements['cancel-job'].hidden = !state.activeJob;
   elements['cancel-job'].disabled = !state.activeJob;
 }
@@ -122,15 +137,13 @@ function renderDocuments() {
   }
 }
 
-function transformPoint(point) {
-  const { widthPoints: width, heightPoints: height, rotation } = state.pageInfo;
-  if (rotation === 90) return { x: height - point.y, y: point.x };
-  if (rotation === 180) return { x: width - point.x, y: height - point.y };
-  if (rotation === 270) return { x: point.y, y: width - point.x };
-  return point;
-}
-
-function transformRect(rect) {
+function transformRect(rect, info) {
+  const transformPoint = (point) => {
+    if (info.rotation === 90) return { x: info.heightPoints - point.y, y: point.x };
+    if (info.rotation === 180) return { x: info.widthPoints - point.x, y: info.heightPoints - point.y };
+    if (info.rotation === 270) return { x: point.y, y: info.widthPoints - point.x };
+    return point;
+  };
   const corners = [
     transformPoint({ x: rect.x, y: rect.y }),
     transformPoint({ x: rect.x + rect.width, y: rect.y }),
@@ -147,8 +160,8 @@ function transformRect(rect) {
   };
 }
 
-function place(element, rect) {
-  const transformed = transformRect(rect);
+function place(element, rect, info) {
+  const transformed = transformRect(rect, info);
   element.style.left = `${transformed.x}px`;
   element.style.top = `${transformed.y}px`;
   element.style.width = `${Math.max(1, transformed.width)}px`;
@@ -156,22 +169,42 @@ function place(element, rect) {
   return transformed;
 }
 
-function renderLayers() {
-  elements['text-layer'].replaceChildren();
-  elements['annotation-layer'].replaceChildren();
-  if (!state.pageInfo || !state.pageText) return;
+function quadBounds(quad) {
+  const xs = [quad.upperLeft.x, quad.upperRight.x, quad.lowerLeft.x, quad.lowerRight.x];
+  const ys = [quad.upperLeft.y, quad.upperRight.y, quad.lowerLeft.y, quad.lowerRight.y];
+  return {
+    x: Math.min(...xs),
+    y: Math.min(...ys),
+    width: Math.max(...xs) - Math.min(...xs),
+    height: Math.max(...ys) - Math.min(...ys),
+  };
+}
 
-  state.pageText.lines.forEach((line, index) => {
+function pageDisplaySize(info) {
+  return info.rotation === 90 || info.rotation === 270
+    ? { width: info.heightPoints, height: info.widthPoints }
+    : { width: info.widthPoints, height: info.heightPoints };
+}
+
+function renderLayers(pageIndex) {
+  const view = state.pageViews.get(pageIndex);
+  if (!view) return;
+  view.textLayer.replaceChildren();
+  view.annotationLayer.replaceChildren();
+  if (!view.layout) return;
+
+  view.layout.units.forEach((unit, index) => {
     const span = document.createElement('span');
-    span.className = 'text-line';
-    span.dataset.lineIndex = String(index);
-    span.textContent = line.text;
-    const bounds = place(span, line.bounds);
+    span.className = 'text-unit';
+    span.dataset.pageIndex = String(pageIndex);
+    span.dataset.unitIndex = String(index);
+    span.textContent = unit.text;
+    const bounds = place(span, quadBounds(unit.quad), view.info);
     span.style.fontSize = `${Math.max(4, bounds.height * 0.76)}px`;
-    elements['text-layer'].append(span);
+    view.textLayer.append(span);
   });
 
-  for (const annotation of state.annotations.filter((item) => item.pageIndex === state.pageIndex)) {
+  for (const annotation of state.annotations.filter((item) => item.pageIndex === pageIndex)) {
     annotation.quads.forEach((quad) => {
       const button = document.createElement('button');
       button.type = 'button';
@@ -180,8 +213,8 @@ function renderLayers() {
       button.title = annotation.quote.exact;
       button.classList.toggle('selected', annotation.id === state.selectedAnnotationId);
       button.addEventListener('click', () => { void selectAnnotation(annotation.id); });
-      place(button, quad);
-      elements['annotation-layer'].append(button);
+      place(button, quad, view.info);
+      view.annotationLayer.append(button);
     });
   }
 }
@@ -194,13 +227,57 @@ function renderNote() {
     elements['note-source'].value = note?.markdownSource || '';
   }
   elements['note-revision'].textContent = `revision ${note?.revision ?? 0}`;
+  renderNotePreview();
+  elements['note-source'].hidden = state.noteMode !== 'edit';
+  elements['note-preview'].hidden = state.noteMode !== 'preview';
+  elements['note-edit-tab'].classList.toggle('selected', state.noteMode === 'edit');
+  elements['note-preview-tab'].classList.toggle('selected', state.noteMode === 'preview');
+  elements['note-edit-tab'].setAttribute('aria-selected', String(state.noteMode === 'edit'));
+  elements['note-preview-tab'].setAttribute('aria-selected', String(state.noteMode === 'preview'));
   updateControls();
+}
+
+function renderNotePreview() {
+  const preview = elements['note-preview'];
+  for (const image of preview.querySelectorAll('img[data-object-url]')) {
+    URL.revokeObjectURL(image.dataset.objectUrl);
+  }
+  preview.innerHTML = window.contextReaderMarkdown.render(elements['note-source'].value);
+  for (const image of preview.querySelectorAll('img[src^="reader-asset:"]')) {
+    const assetId = image.getAttribute('src').slice('reader-asset:'.length);
+    void api.readAsset(assetId).then(({ asset, bytes }) => {
+      const objectUrl = URL.createObjectURL(new Blob([bytes], { type: asset.mediaType }));
+      image.src = objectUrl;
+      image.dataset.objectUrl = objectUrl;
+    }).catch(() => image.remove());
+  }
+}
+
+async function insertNoteAsset() {
+  const annotation = selectedAnnotation();
+  if (!annotation) return;
+  const sourcePath = await api.chooseNoteAsset();
+  if (!sourcePath) return;
+  const asset = await perform('正在导入图片', () => awaitJob(api.importNoteAsset(annotation.id, sourcePath)));
+  if (!asset) return;
+  const source = elements['note-source'];
+  const markdown = `![image](reader-asset:${asset.id})`;
+  const start = source.selectionStart;
+  const end = source.selectionEnd;
+  source.setRangeText(markdown, start, end, 'end');
+  source.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function setNoteMode(mode) {
+  state.noteMode = mode;
+  renderNote();
 }
 
 async function selectAnnotation(annotationId) {
   if (annotationId !== state.selectedAnnotationId) await flushPendingNote();
   state.selectedAnnotationId = annotationId;
-  renderLayers();
+  const annotation = selectedAnnotation();
+  if (annotation) renderLayers(annotation.pageIndex);
   renderNote();
 }
 
@@ -229,21 +306,43 @@ async function flushPendingNote() {
   return selectedNote();
 }
 
-function selectionChanged() {
+function selectionUnitFromNode(node) {
+  const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+  return element?.closest?.('.text-unit') ?? null;
+}
+
+async function selectionChanged() {
   const selection = window.getSelection();
-  state.selectedLines = [];
-  state.selectionText = '';
+  state.pendingSelection = null;
   if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
     updateControls();
     return;
   }
-  const range = selection.getRangeAt(0);
-  for (const line of elements['text-layer'].querySelectorAll('.text-line')) {
-    if (range.intersectsNode(line)) {
-      state.selectedLines.push(Number(line.dataset.lineIndex));
-    }
+  const startElement = selectionUnitFromNode(selection.anchorNode);
+  const endElement = selectionUnitFromNode(selection.focusNode);
+  if (!startElement || !endElement || startElement.dataset.pageIndex !== endElement.dataset.pageIndex) {
+    updateControls();
+    return;
   }
-  state.selectionText = selection.toString().trim();
+  const pageIndex = Number(startElement.dataset.pageIndex);
+  const view = state.pageViews.get(pageIndex);
+  const startUnit = view?.layout?.units[Number(startElement.dataset.unitIndex)];
+  const endUnit = view?.layout?.units[Number(endElement.dataset.unitIndex)];
+  if (!startUnit || !endUnit) return;
+  const center = (quad) => {
+    const bounds = quadBounds(quad);
+    return { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 };
+  };
+  const generation = state.generation;
+  try {
+    const exact = await api.selectText(pageIndex, center(startUnit.quad), center(endUnit.quad));
+    if (generation !== state.generation) return;
+    state.pendingSelection = exact;
+    state.pageIndex = pageIndex;
+    updatePageIndicator();
+  } catch (error) {
+    setStatus(errorMessage(error), true);
+  }
   updateControls();
 }
 
@@ -259,6 +358,7 @@ async function openWorkspaceAt(workspacePath, create) {
       if (state.document) await api.closeDocument();
       await api.closeWorkspace();
     }
+    clearPageViews();
     state.workspace = create
       ? await api.createWorkspace(workspacePath)
       : await api.openWorkspace(workspacePath);
@@ -292,6 +392,38 @@ async function choosePdf() {
   if (sourcePath) await importPdfAt(sourcePath);
 }
 
+async function exportWorkspace() {
+  const destination = await api.chooseBackupExport();
+  if (!destination) return;
+  await perform('正在导出工作区', () => awaitJob(api.exportWorkspace(destination)));
+}
+
+async function restoreWorkspace() {
+  const packagePath = await api.chooseBackupOpen();
+  if (!packagePath) return;
+  const inspection = await api.inspectBackup(packagePath);
+  if (!inspection.valid) throw new Error('备份验证失败');
+  const target = await api.chooseRestoreTarget();
+  if (!target) return;
+  await flushPendingNote();
+  await perform('正在恢复工作区', async () => {
+    if (state.document) await api.closeDocument();
+    if (state.workspace) await api.closeWorkspace();
+    clearPageViews();
+    state.document = null;
+    state.workspace = await awaitJob(api.restoreWorkspace(packagePath, target));
+    state.annotations = [];
+    state.notes = [];
+    await refreshDocuments();
+  });
+}
+
+async function exportDiagnostics() {
+  const destination = await api.chooseDiagnosticsExport();
+  if (!destination) return;
+  await perform('正在导出诊断包', () => awaitJob(api.exportDiagnostics(destination)));
+}
+
 async function openDocument(documentRecord) {
   await flushPendingNote();
   await perform('正在打开文档', async () => {
@@ -303,79 +435,293 @@ async function openDocument(documentRecord) {
     state.noteDirty = false;
     state.annotations = await api.listAnnotations(state.document.versionId);
     state.notes = await api.listNotes(state.document.versionId);
-    await renderPage();
+    state.pageInfos = [];
+    for (let start = 0; start < state.document.pageCount; start += 16) {
+      const indexes = Array.from(
+        { length: Math.min(16, state.document.pageCount - start) },
+        (_, offset) => start + offset,
+      );
+      state.pageInfos.push(...await Promise.all(indexes.map((index) => api.pageInfo(index))));
+    }
+    initializePageViews();
+    const firstView = state.pageViews.get(0);
+    if (firstView) {
+      firstView.near = true;
+      await activatePage(0);
+    }
   });
   renderDocuments();
   updateControls();
 }
 
-async function renderPage() {
-  const [pageInfo, rendered, pageText] = await Promise.all([
-    api.pageInfo(state.pageIndex),
-    awaitJob(api.renderPage(state.pageIndex, state.zoom)),
-    api.extractPageText(state.pageIndex),
-  ]);
-  state.pageInfo = pageInfo;
-  state.pageText = pageText;
-  if (state.imageUrl) URL.revokeObjectURL(state.imageUrl);
-  const png = rendered.png?.data ? new Uint8Array(rendered.png.data) : new Uint8Array(rendered.png);
-  state.imageUrl = URL.createObjectURL(new Blob([png], { type: 'image/png' }));
-  elements['page-image'].src = state.imageUrl;
-  elements['page-stage'].style.width = `${rendered.widthPixels}px`;
-  elements['page-stage'].style.height = `${rendered.heightPixels}px`;
-  elements['page-stage'].hidden = false;
-  elements['empty-state'].hidden = true;
-  elements['page-indicator'].textContent = `${state.pageIndex + 1} / ${state.document.pageCount}`;
+function cancelTileWork() {
+  state.tileQueue.length = 0;
+  for (const job of state.tileJobs.values()) job.cancel();
+  state.tileJobs.clear();
+}
+
+function bumpGeneration(clearTiles = false) {
+  state.generation += 1;
+  cancelTileWork();
+  state.pendingSelection = null;
+  if (clearTiles) {
+    for (const view of state.pageViews.values()) view.tileLayer.replaceChildren();
+  }
+}
+
+function updatePageIndicator() {
+  elements['page-indicator'].textContent = state.document
+    ? `${state.pageIndex + 1} / ${state.document.pageCount}` : '0 / 0';
   elements['zoom-value'].textContent = `${Math.round(state.zoom * 100)}%`;
-  renderLayers();
+}
+
+function clearPageViews() {
+  state.pageObserver?.disconnect();
+  state.pageObserver = null;
+  bumpGeneration(true);
+  state.pageViews.clear();
+  elements['pages-container'].replaceChildren();
+}
+
+function initializePageViews() {
+  clearPageViews();
+  const fragment = document.createDocumentFragment();
+  for (const info of state.pageInfos) {
+    const display = pageDisplaySize(info);
+    const stage = document.createElement('section');
+    stage.className = 'page-stage';
+    stage.dataset.pageIndex = String(info.index);
+    stage.setAttribute('aria-label', `第 ${info.index + 1} 页`);
+    stage.style.width = `${display.width * state.zoom}px`;
+    stage.style.height = `${display.height * state.zoom}px`;
+    const tileLayer = document.createElement('div');
+    tileLayer.className = 'tile-layer';
+    const annotationLayer = document.createElement('div');
+    annotationLayer.className = 'annotation-layer';
+    const textLayer = document.createElement('div');
+    textLayer.className = 'text-layer';
+    stage.append(tileLayer, annotationLayer, textLayer);
+    state.pageViews.set(info.index, {
+      info, stage, tileLayer, annotationLayer, textLayer, layout: null, near: false,
+    });
+    fragment.append(stage);
+  }
+  elements['pages-container'].append(fragment);
+  elements['pages-container'].hidden = false;
+  elements['empty-state'].hidden = true;
+  state.pageObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const pageIndex = Number(entry.target.dataset.pageIndex);
+      const view = state.pageViews.get(pageIndex);
+      if (!view) continue;
+      view.near = entry.isIntersecting || pageIndex === state.pageIndex;
+      if (view.near) void activatePage(pageIndex);
+      else {
+        view.tileLayer.replaceChildren();
+        view.textLayer.replaceChildren();
+        view.annotationLayer.replaceChildren();
+      }
+    }
+  }, { root: elements['reader-scroll'], rootMargin: '800px 0px', threshold: 0 });
+  for (const view of state.pageViews.values()) state.pageObserver.observe(view.stage);
+  updatePageIndicator();
   renderNote();
+}
+
+function tileKey(request) {
+  return [state.document.versionId, request.pageIndex, request.pixelsPerPoint,
+    request.xPixels, request.yPixels, request.widthPixels, request.heightPixels].join(':');
+}
+
+function cacheTile(key, tile) {
+  const pixels = new Uint8ClampedArray(tile.rgba);
+  const existing = state.tileCache.get(key);
+  if (existing) state.tileCacheBytes -= existing.pixels.byteLength;
+  state.tileCache.delete(key);
+  state.tileCache.set(key, { ...tile, pixels });
+  state.tileCacheBytes += pixels.byteLength;
+  while (state.tileCacheBytes > tileCacheBudgetBytes && state.tileCache.size > 1) {
+    const oldestKey = state.tileCache.keys().next().value;
+    const oldest = state.tileCache.get(oldestKey);
+    state.tileCache.delete(oldestKey);
+    state.tileCacheBytes -= oldest.pixels.byteLength;
+  }
+  return state.tileCache.get(key);
+}
+
+function drawTile(view, tile, dpr) {
+  if (!view.near || view.tileLayer.querySelector(`[data-tile-key="${tile.key}"]`)) return;
+  const canvas = document.createElement('canvas');
+  canvas.className = 'tile-canvas';
+  canvas.dataset.tileKey = tile.key;
+  canvas.width = tile.widthPixels;
+  canvas.height = tile.heightPixels;
+  canvas.style.left = `${tile.xPixels / dpr}px`;
+  canvas.style.top = `${tile.yPixels / dpr}px`;
+  canvas.style.width = `${tile.widthPixels / dpr}px`;
+  canvas.style.height = `${tile.heightPixels / dpr}px`;
+  canvas.getContext('2d', { alpha: false }).putImageData(
+    new ImageData(tile.pixels, tile.widthPixels, tile.heightPixels), 0, 0,
+  );
+  view.tileLayer.append(canvas);
+}
+
+function pumpTileQueue() {
+  while (state.activeTileCount < maximumConcurrentTiles && state.tileQueue.length > 0) {
+    const item = state.tileQueue.shift();
+    if (item.generation !== state.generation || !item.view.near) continue;
+    const job = api.renderTile(item.request);
+    state.tileJobs.set(job.id, job);
+    state.activeTileCount += 1;
+    job.result.then((result) => {
+      if (result.generation !== state.generation || item.generation !== state.generation) return;
+      const tile = cacheTile(item.key, result);
+      tile.key = item.key;
+      drawTile(item.view, tile, item.dpr);
+    }).catch((error) => {
+      if (error?.code !== 'CANCELLED') setStatus(errorMessage(error), true);
+    }).finally(() => {
+      state.tileJobs.delete(job.id);
+      state.activeTileCount -= 1;
+      pumpTileQueue();
+    });
+  }
+}
+
+function schedulePageTiles(pageIndex) {
+  const view = state.pageViews.get(pageIndex);
+  if (!view?.near) return;
+  const dpr = window.devicePixelRatio || 1;
+  const scale = state.zoom * dpr;
+  const display = pageDisplaySize(view.info);
+  const pageWidth = Math.ceil(display.width * scale);
+  const pageHeight = Math.ceil(display.height * scale);
+  for (let y = 0; y < pageHeight; y += tileEdge) {
+    for (let x = 0; x < pageWidth; x += tileEdge) {
+      const request = {
+        pageIndex, pixelsPerPoint: scale, xPixels: x, yPixels: y,
+        widthPixels: Math.min(tileEdge, pageWidth - x),
+        heightPixels: Math.min(tileEdge, pageHeight - y), generation: state.generation,
+      };
+      const key = tileKey(request);
+      const cached = state.tileCache.get(key);
+      if (cached) {
+        state.tileCache.delete(key);
+        state.tileCache.set(key, cached);
+        cached.key = key;
+        drawTile(view, cached, dpr);
+      } else {
+        state.tileQueue.push({ request, key, view, dpr, generation: state.generation });
+      }
+    }
+  }
+  pumpTileQueue();
+}
+
+async function activatePage(pageIndex) {
+  const view = state.pageViews.get(pageIndex);
+  if (!view?.near) return;
+  schedulePageTiles(pageIndex);
+  if (!view.layout) {
+    const generation = state.generation;
+    try {
+      const layout = await api.pageTextLayout(pageIndex);
+      if (!view.near || generation !== state.generation) return;
+      view.layout = layout;
+    } catch (error) {
+      setStatus(errorMessage(error), true);
+      return;
+    }
+  }
+  renderLayers(pageIndex);
+}
+
+async function waitForTileIdle(timeoutMs = 5000) {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    const hasCanvas = elements['pages-container'].querySelector('.tile-canvas') !== null;
+    if (hasCanvas && state.activeTileCount === 0 && state.tileQueue.length === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(
+    `Visible Tile rendering timed out (active=${state.activeTileCount}, queued=${state.tileQueue.length}, generation=${state.generation}, status=${elements.status.textContent})`,
+  );
+}
+
+function inspectTilePixels() {
+  let minimum = 255;
+  let maximum = 0;
+  let canvasCount = 0;
+  for (const canvas of elements['pages-container'].querySelectorAll('.tile-canvas')) {
+    canvasCount += 1;
+    const pixels = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+    const stride = Math.max(4, Math.floor(pixels.length / 4096 / 4) * 4);
+    for (let index = 0; index < pixels.length; index += stride) {
+      minimum = Math.min(minimum, pixels[index], pixels[index + 1], pixels[index + 2]);
+      maximum = Math.max(maximum, pixels[index], pixels[index + 1], pixels[index + 2]);
+    }
+  }
+  return { canvasCount, minimum, maximum };
+}
+
+function visiblePageIndex() {
+  const viewport = elements['reader-scroll'].getBoundingClientRect();
+  let best = state.pageIndex;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const [pageIndex, view] of state.pageViews) {
+    const rect = view.stage.getBoundingClientRect();
+    if (rect.bottom < viewport.top || rect.top > viewport.bottom) continue;
+    const distance = Math.abs((rect.top + rect.bottom) / 2 - (viewport.top + viewport.bottom) / 2);
+    if (distance < bestDistance) {
+      best = pageIndex;
+      bestDistance = distance;
+    }
+  }
+  return best;
 }
 
 async function changePage(delta) {
   const target = state.pageIndex + delta;
   if (target < 0 || target >= state.document.pageCount) return;
   await flushPendingNote();
-  await perform('正在加载页面', async () => {
-    state.pageIndex = target;
-    state.selectedAnnotationId = null;
-    await renderPage();
-  });
+  state.pageIndex = target;
+  state.selectedAnnotationId = null;
+  state.pageViews.get(target)?.stage.scrollIntoView({ block: 'start' });
+  updatePageIndicator();
   updateControls();
 }
 
 async function changeZoom(delta) {
   const next = Math.min(3, Math.max(0.5, Number((state.zoom + delta).toFixed(2))));
   if (next === state.zoom) return;
-  await perform('正在缩放页面', async () => {
-    state.zoom = next;
-    await renderPage();
-  });
+  state.zoom = next;
+  initializePageViews();
+  state.pageViews.get(state.pageIndex)?.stage.scrollIntoView({ block: 'start' });
   updateControls();
 }
 
 async function createHighlight() {
-  if (state.selectedLines.length === 0) return null;
+  const selection = state.pendingSelection;
+  if (!selection) return null;
   await flushPendingNote();
-  const lines = state.selectedLines.map((index) => state.pageText.lines[index]);
   const annotation = await perform('正在保存高亮', () => api.createAnnotation({
     documentVersionId: state.document.versionId,
-    pageIndex: state.pageIndex,
-    quads: lines.map((line) => line.bounds),
-    quote: {
-      exact: state.selectionText || lines.map((line) => line.text).join('\n'),
-      prefix: '',
-      suffix: '',
-    },
-    layoutVersion: 'mupdf-1.28.3',
+    pageIndex: selection.pageIndex,
+    quads: selection.quads.map(quadBounds),
+    quote: selection.quote,
+    layoutVersion: String(selection.layoutVersion),
     color: state.highlightColor,
+    anchorVersion: 2,
+    textStart: selection.logicalStart,
+    textEnd: selection.logicalEnd,
+    direction: selection.direction,
   }));
   if (!annotation) return null;
   state.annotations.push(annotation);
   state.selectedAnnotationId = annotation.id;
-  state.selectedLines = [];
-  state.selectionText = '';
+  state.pendingSelection = null;
   window.getSelection()?.removeAllRanges();
-  renderLayers();
+  renderLayers(selection.pageIndex);
   renderNote();
   return annotation;
 }
@@ -424,7 +770,7 @@ async function deleteAnnotation() {
   state.annotations = state.annotations.filter((item) => item.id !== annotation.id);
   state.notes = state.notes.filter((item) => item.annotationId !== annotation.id);
   state.selectedAnnotationId = null;
-  renderLayers();
+  renderLayers(annotation.pageIndex);
   renderNote();
 }
 
@@ -451,6 +797,9 @@ function inspectUiContract() {
 
 elements['create-workspace'].addEventListener('click', () => chooseWorkspace('create'));
 elements['open-workspace'].addEventListener('click', () => chooseWorkspace('open'));
+elements['export-workspace'].addEventListener('click', exportWorkspace);
+elements['restore-workspace'].addEventListener('click', () => restoreWorkspace().catch((error) => setStatus(errorMessage(error), true)));
+elements['export-diagnostics'].addEventListener('click', exportDiagnostics);
 elements['import-pdf'].addEventListener('click', choosePdf);
 elements['previous-page'].addEventListener('click', () => changePage(-1));
 elements['next-page'].addEventListener('click', () => changePage(1));
@@ -459,14 +808,44 @@ elements['zoom-in'].addEventListener('click', () => changeZoom(0.25));
 elements['highlight-selection'].addEventListener('click', createHighlight);
 elements['save-note'].addEventListener('click', () => saveNote(false));
 elements['delete-annotation'].addEventListener('click', deleteAnnotation);
-elements['note-source'].addEventListener('input', scheduleNoteAutosave);
+elements['note-source'].addEventListener('input', () => {
+  renderNotePreview();
+  scheduleNoteAutosave();
+});
+elements['note-edit-tab'].addEventListener('click', () => setNoteMode('edit'));
+elements['note-preview-tab'].addEventListener('click', () => setNoteMode('preview'));
+elements['insert-note-asset'].addEventListener('click', insertNoteAsset);
+elements['note-preview'].addEventListener('click', (event) => {
+  if (event.target.closest('a')) event.preventDefault();
+});
 elements['cancel-job'].addEventListener('click', () => {
   if (!state.activeJob) return;
   state.activeJob.cancel();
   setStatus('正在取消操作');
   elements['cancel-job'].disabled = true;
 });
-elements['text-layer'].addEventListener('mouseup', selectionChanged);
+elements['pages-container'].addEventListener('mouseup', () => { void selectionChanged(); });
+elements['reader-scroll'].addEventListener('scroll', () => {
+  if (!state.document) return;
+  bumpGeneration(false);
+  state.pageIndex = visiblePageIndex();
+  updatePageIndicator();
+  updateControls();
+  if (state.scrollRenderTimer !== null) clearTimeout(state.scrollRenderTimer);
+  state.scrollRenderTimer = setTimeout(() => {
+    state.scrollRenderTimer = null;
+    for (const [pageIndex, view] of state.pageViews) {
+      if (view.near) void activatePage(pageIndex);
+    }
+  }, 60);
+}, { passive: true });
+window.addEventListener('resize', () => {
+  const nextDpr = window.devicePixelRatio || 1;
+  if (!state.document || nextDpr === state.devicePixelRatio) return;
+  state.devicePixelRatio = nextDpr;
+  initializePageViews();
+  state.pageViews.get(state.pageIndex)?.stage.scrollIntoView({ block: 'start' });
+});
 
 for (const swatch of document.querySelectorAll('.swatch')) {
   swatch.addEventListener('click', () => {
@@ -484,14 +863,16 @@ async function runSmoke() {
     if (config.phase === 'setup') {
       await openWorkspaceAt(config.workspacePath, true);
       await importPdfAt(config.fixturePath);
-      const firstLine = elements['text-layer'].querySelector('.text-line');
+      await waitForTileIdle();
+      const firstLine = elements['pages-container'].querySelector('.text-unit');
       const range = document.createRange();
       range.selectNodeContents(firstLine);
       const selection = window.getSelection();
       selection.removeAllRanges();
       selection.addRange(range);
       firstLine.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-      const selectedLineCount = state.selectedLines.length;
+      await selectionChanged();
+      const selectedLineCount = state.pendingSelection ? 1 : 0;
       const annotation = await createHighlight();
       elements['note-source'].value = 'Renderer **autosaved** note';
       elements['note-source'].dispatchEvent(new Event('input', { bubbles: true }));
@@ -508,6 +889,7 @@ async function runSmoke() {
         noteRevision: note?.revision,
         noteMarkdown: note?.markdownSource,
         uiContract: inspectUiContract(),
+        tileContract: inspectTilePixels(),
       });
       await api.closeDocument();
       state.document = null;

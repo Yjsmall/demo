@@ -7,7 +7,6 @@
 #include <memory>
 #include <string_view>
 
-#include <sqlite3.h>
 #include <windows.h>
 
 #include "context_reader/pdf/mupdf_engine.hpp"
@@ -25,75 +24,6 @@ void check(bool condition, std::string_view message) {
         std::cerr << "FAILED: " << message << '\n';
         ++failures;
     }
-}
-
-bool create_schema_v1_workspace(const std::filesystem::path& root) {
-    std::error_code filesystem_error;
-    std::filesystem::create_directories(root, filesystem_error);
-    if(filesystem_error) return false;
-    sqlite3* database = nullptr;
-    const auto path = root / "workspace.db";
-    const auto path_utf8 = path.u8string();
-    const std::string path_string(
-        reinterpret_cast<const char*>(path_utf8.data()),
-        path_utf8.size()
-    );
-    if(sqlite3_open(path_string.c_str(), &database) != SQLITE_OK) {
-        if(database != nullptr) sqlite3_close(database);
-        return false;
-    }
-    constexpr const char* schema = R"sql(
-CREATE TABLE workspace_metadata (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    workspace_id BLOB NOT NULL CHECK (length(workspace_id) = 16),
-    schema_version INTEGER NOT NULL,
-    created_at INTEGER NOT NULL
-) STRICT;
-CREATE TABLE documents (
-    id BLOB PRIMARY KEY CHECK (length(id) = 16),
-    title TEXT NOT NULL,
-    active_version_id BLOB,
-    created_at INTEGER NOT NULL,
-    FOREIGN KEY (active_version_id) REFERENCES document_versions(id)
-) STRICT;
-CREATE TABLE document_versions (
-    id BLOB PRIMARY KEY CHECK (length(id) = 16),
-    document_id BLOB NOT NULL REFERENCES documents(id),
-    content_hash TEXT NOT NULL UNIQUE CHECK (length(content_hash) = 64),
-    object_key TEXT NOT NULL UNIQUE,
-    byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
-    page_count INTEGER NOT NULL CHECK (page_count >= 0),
-    created_at INTEGER NOT NULL
-) STRICT;
-INSERT INTO workspace_metadata(singleton, workspace_id, schema_version, created_at)
-VALUES (1, randomblob(16), 1, unixepoch());
-PRAGMA user_version = 1;
-)sql";
-    const auto result = sqlite3_exec(database, schema, nullptr, nullptr, nullptr);
-    sqlite3_close(database);
-    return result == SQLITE_OK;
-}
-
-int database_user_version(const std::filesystem::path& path) {
-    sqlite3* database = nullptr;
-    const auto path_utf8 = path.u8string();
-    const std::string path_string(
-        reinterpret_cast<const char*>(path_utf8.data()),
-        path_utf8.size()
-    );
-    if(sqlite3_open_v2(path_string.c_str(), &database, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
-        if(database != nullptr) sqlite3_close(database);
-        return -1;
-    }
-    sqlite3_stmt* statement = nullptr;
-    int version = -1;
-    if(sqlite3_prepare_v2(database, "PRAGMA user_version", -1, &statement, nullptr) == SQLITE_OK
-       && sqlite3_step(statement) == SQLITE_ROW) {
-        version = sqlite3_column_int(statement, 0);
-    }
-    if(statement != nullptr) sqlite3_finalize(statement);
-    sqlite3_close(database);
-    return version;
 }
 
 }  // namespace
@@ -123,7 +53,7 @@ int main() {
     auto workspace = std::move(create_result).value();
     const auto initial_info = workspace->info();
     check(!initial_info.id.is_nil(), "workspace ID is non-nil");
-    check(initial_info.schema_version == 2U, "workspace schema version is two");
+    check(initial_info.schema_version == 4U, "workspace schema version is four");
     check(
         std::filesystem::is_regular_file(workspace_root / "workspace.db"),
         "workspace database exists"
@@ -244,6 +174,111 @@ int main() {
             .markdown_source = "Updated **context** note",
         });
         check(updated.has_value() && updated.value().revision == 2U, "matching note revision updates");
+    }
+
+    const auto asset_annotation = workspace->create_annotation(CreateAnnotation{
+        .document_version_id = imported.document.version_id,
+        .page_index = 0U,
+        .quads = {{.x = 72.0, .y = 140.0, .width = 90.0, .height = 18.0}},
+        .quote = {.exact = "asset anchor", .prefix = "", .suffix = ""},
+        .layout_version = "1",
+        .color = HighlightColor::blue,
+        .anchor_version = 2U,
+        .text_start = 0U,
+        .text_end = 12U,
+        .direction = "ltr",
+    });
+    check(asset_annotation.has_value(), "character-anchored annotation is created");
+    std::optional<AssetRecord> imported_asset;
+    if(asset_annotation) {
+        constexpr std::array<std::uint8_t, 68> png_bytes{
+            0x89U, 0x50U, 0x4EU, 0x47U, 0x0DU, 0x0AU, 0x1AU, 0x0AU,
+            0x00U, 0x00U, 0x00U, 0x0DU, 0x49U, 0x48U, 0x44U, 0x52U,
+            0x00U, 0x00U, 0x00U, 0x01U, 0x00U, 0x00U, 0x00U, 0x01U,
+            0x08U, 0x04U, 0x00U, 0x00U, 0x00U, 0xB5U, 0x1CU, 0x0CU,
+            0x02U, 0x00U, 0x00U, 0x00U, 0x0BU, 0x49U, 0x44U, 0x41U,
+            0x54U, 0x78U, 0xDAU, 0x63U, 0x64U, 0xF8U, 0x0FU, 0x00U,
+            0x01U, 0x05U, 0x01U, 0x01U, 0x27U, 0x18U, 0xE3U, 0x66U,
+            0x00U, 0x00U, 0x00U, 0x00U, 0x49U, 0x45U, 0x4EU, 0x44U,
+            0xAEU, 0x42U, 0x60U, 0x82U,
+        };
+        const auto asset_source = test_output_root / "asset.png";
+        {
+            std::ofstream output(asset_source, std::ios::binary);
+            output.write(
+                reinterpret_cast<const char*>(png_bytes.data()),
+                static_cast<std::streamsize>(png_bytes.size())
+            );
+        }
+        const auto first_asset = workspace->import_note_asset(asset_annotation.value().id, asset_source);
+        const auto duplicate_asset = workspace->import_note_asset(asset_annotation.value().id, asset_source);
+        check(first_asset.has_value(), "WIC-validated PNG asset is imported");
+        check(
+            first_asset && duplicate_asset && first_asset.value().id == duplicate_asset.value().id,
+            "content-addressed asset import is deduplicated"
+        );
+        if(first_asset) {
+            imported_asset = first_asset.value();
+            const auto asset_note = workspace->update_note(UpdateNote{
+                .annotation_id = asset_annotation.value().id,
+                .expected_revision = 0U,
+                .markdown_source = "Asset note ![pixel](reader-asset:" +
+                    stable_id_to_hex(first_asset.value().id) + ")",
+            });
+            check(asset_note.has_value(), "note coordinates its reader-asset reference");
+            const auto read_asset = workspace->read_asset(first_asset.value().id);
+            check(
+                read_asset && read_asset.value().bytes.size() == png_bytes.size(),
+                "asset bytes round-trip through the workspace"
+            );
+        }
+    }
+
+    const auto rebuild_index = workspace->rebuild_search_index();
+    check(rebuild_index.has_value(), "derived search index is rebuilt");
+    const auto pdf_search = workspace->search("Context Reader", 10U);
+    check(
+        pdf_search && pdf_search.value().index_status == "ready"
+            && std::any_of(
+                pdf_search.value().results.begin(), pdf_search.value().results.end(),
+                [](const SearchResultItem& item) { return item.kind == SearchResultKind::pdf_page; }
+            ),
+        "trigram search returns a PDF page"
+    );
+    const auto short_search = workspace->search("A", 10U);
+    check(short_search && short_search.value().index_status == "ready", "short search uses bounded scan");
+
+    const auto package_path = test_output_root / "workspace.readerpkg";
+    const auto exported_package = workspace->export_package(package_path);
+    check(exported_package && exported_package.value().valid, "readerpkg export is valid");
+    const auto inspected_package = SqliteWorkspace::inspect_package(package_path);
+    check(inspected_package && inspected_package.value().valid, "readerpkg validates offline");
+    const auto restored_root = test_output_root / "restored-workspace";
+    const auto restored_info = SqliteWorkspace::restore_package(package_path, restored_root);
+    check(
+        restored_info && restored_info.value().id == initial_info.id,
+        "readerpkg restores the authoritative workspace identity"
+    );
+    if(restored_info && imported_asset) {
+        auto restored_workspace = SqliteWorkspace::open(restored_root, pdf_engine);
+        check(restored_workspace.has_value(), "restored workspace opens");
+        if(restored_workspace) {
+            const auto restored_asset = restored_workspace.value()->read_asset(imported_asset->id);
+            check(
+                restored_asset && restored_asset.value().asset.content_sha256 == imported_asset->content_sha256,
+                "restored asset hash matches the package manifest"
+            );
+            const auto restored_verification = restored_workspace.value()->verify();
+            check(restored_verification && restored_verification.value().valid, "restored workspace verifies");
+        }
+    }
+    if(asset_annotation && imported_asset) {
+        check(workspace->delete_annotation(asset_annotation.value().id).has_value(), "asset annotation is deleted");
+        const auto reclaimed_asset = workspace->read_asset(imported_asset->id);
+        check(
+            !reclaimed_asset && reclaimed_asset.error().code() == ErrorCode::not_found,
+            "deleting the final reference reclaims the asset"
+        );
     }
 
     const auto invalid_annotation = workspace->create_annotation(CreateAnnotation{
@@ -383,69 +418,6 @@ int main() {
             "existing workspace error is stable"
         );
     }
-
-    const auto legacy_root = test_output_root / "legacy-v1";
-    check(create_schema_v1_workspace(legacy_root), "schema v1 migration fixture is created");
-    auto legacy_open = SqliteWorkspace::open(legacy_root, pdf_engine);
-    check(
-        legacy_open.has_value() && legacy_open.value()->info().schema_version == 2U,
-        "schema v1 workspace migrates to schema v2"
-    );
-    if(legacy_open) {
-        auto migrated_workspace = std::move(legacy_open).value();
-        migrated_workspace.reset();
-    }
-    std::vector<std::filesystem::path> migration_backups;
-    const auto backup_root = legacy_root / "backups";
-    if(std::filesystem::exists(backup_root)) {
-        for(const auto& entry : std::filesystem::directory_iterator(backup_root)) {
-            if(entry.is_regular_file()) migration_backups.push_back(entry.path());
-        }
-    }
-    check(migration_backups.size() == 1U, "migration creates exactly one pre-migration backup");
-    if(migration_backups.size() == 1U) {
-        check(
-            database_user_version(migration_backups.front()) == 1,
-            "migration backup preserves the source schema"
-        );
-    }
-
-    const auto retry_migration_root = test_output_root / "legacy-v1-retry";
-    check(create_schema_v1_workspace(retry_migration_root), "retry migration fixture is created");
-    SetEnvironmentVariableA("CONTEXT_READER_TEST_MIGRATION_FAULT", "after-backup");
-    const auto failed_before_migration = SqliteWorkspace::open(retry_migration_root, pdf_engine);
-    SetEnvironmentVariableA("CONTEXT_READER_TEST_MIGRATION_FAULT", nullptr);
-    check(
-        !failed_before_migration.has_value()
-            && failed_before_migration.error().code() == ErrorCode::storage_failure
-            && database_user_version(retry_migration_root / "workspace.db") == 1,
-        "migration failure after backup leaves schema v1 authoritative"
-    );
-    auto retried_migration = SqliteWorkspace::open(retry_migration_root, pdf_engine);
-    check(
-        retried_migration.has_value() && retried_migration.value()->info().schema_version == 2U,
-        "migration succeeds when retried after backup failure"
-    );
-    if(retried_migration) retried_migration.value().reset();
-
-    const auto committed_migration_root = test_output_root / "legacy-v1-committed";
-    check(create_schema_v1_workspace(committed_migration_root), "committed migration fixture is created");
-    SetEnvironmentVariableA("CONTEXT_READER_TEST_MIGRATION_FAULT", "after-migration");
-    const auto failed_after_migration = SqliteWorkspace::open(committed_migration_root, pdf_engine);
-    SetEnvironmentVariableA("CONTEXT_READER_TEST_MIGRATION_FAULT", nullptr);
-    check(
-        !failed_after_migration.has_value()
-            && failed_after_migration.error().code() == ErrorCode::storage_failure
-            && database_user_version(committed_migration_root / "workspace.db") == 2,
-        "migration failure after commit leaves schema v2 authoritative"
-    );
-    auto committed_migration_reopen = SqliteWorkspace::open(committed_migration_root, pdf_engine);
-    check(
-        committed_migration_reopen.has_value()
-            && committed_migration_reopen.value()->info().schema_version == 2U,
-        "workspace reopens after committed migration failure"
-    );
-    if(committed_migration_reopen) committed_migration_reopen.value().reset();
 
     const auto facade_root = test_output_root / "facade-workspace";
     auto runtime_result = ReaderRuntime::create();

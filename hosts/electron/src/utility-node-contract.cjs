@@ -54,6 +54,27 @@ async function run() {
     if (secondRender.png[0] !== 0x89) {
       throw new Error('renderPage reused mutable Buffer storage');
     }
+    const page = await readerNode.pageInfo(0);
+    const tile = await readerNode.renderTile({
+      pageIndex: 0,
+      pixelsPerPoint: 1,
+      xPixels: 0,
+      yPixels: 0,
+      widthPixels: Math.min(128, Math.floor(page.heightPoints)),
+      heightPixels: Math.min(128, Math.floor(page.widthPoints)),
+      generation: 7,
+    }, 'contract-tile');
+    if (!(tile.rgba instanceof ArrayBuffer) || tile.rgba.byteLength !== tile.widthPixels * tile.heightPixels * 4
+        || tile.generation !== 7) {
+      throw new Error('renderTile did not return an owned generation-bound RGBA ArrayBuffer');
+    }
+    const layout = await readerNode.pageTextLayout(0);
+    if (!layout.units.length || !layout.lines.length) throw new Error('pageTextLayout returned no selection units');
+    const firstUnit = layout.units[0];
+    const selection = await readerNode.selectText(0, firstUnit.quad.upperLeft, firstUnit.quad.lowerRight);
+    if (!selection.text || selection.logicalEnd <= selection.logicalStart || !selection.quads.length) {
+      throw new Error('selectText returned an invalid character anchor');
+    }
 
     const activeRender = readerNode.renderPage(0, 16, 'contract-duplicate-job');
     const duplicateJobCode = await expectCode(
@@ -75,8 +96,14 @@ async function run() {
     const note = await readerNode.updateNote({
       annotationId: annotation.id,
       expectedRevision: 0,
-      markdownSource: 'Node contract note',
+      markdownSource: 'Context note',
     });
+    await readerNode.rebuildSearchIndex('contract-search-index');
+    const search = await readerNode.search({ query: 'Context', limit: 20 });
+    if (search.indexStatus !== 'ready' || !search.results.some((entry) => entry.kind === 'pdfPage')
+        || !search.results.some((entry) => entry.kind === 'note')) {
+      throw new Error('search did not return combined PDF and note results');
+    }
     const revisionConflict = await expectCode(
       () => readerNode.updateNote({
         annotationId: annotation.id,
@@ -108,6 +135,9 @@ async function run() {
       unknownCancellation,
       pngByteLength: secondRender.png.length,
       pngValid: secondRender.png.subarray(0, 8).toString('hex') === '89504e470d0a1a0a',
+      tileValid: tile.rgba.byteLength === tile.widthPixels * tile.heightPixels * 4,
+      selectionValid: selection.quads.length > 0,
+      searchValid: search.indexStatus === 'ready' && search.results.length >= 2,
       revisionConflict,
       annotationCount: annotations.length,
       noteCount: notes.length,

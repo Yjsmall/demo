@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <optional>
 #include <vector>
 
 #include "context_reader/pdf/page_geometry.hpp"
@@ -30,6 +31,10 @@ struct CreateAnnotation final {
     QuoteAnchor quote;
     std::string layout_version;
     HighlightColor color;
+    std::uint32_t anchor_version = 1;
+    std::optional<std::size_t> text_start;
+    std::optional<std::size_t> text_end;
+    std::string direction = "ltr";
 };
 
 struct AnnotationRecord final {
@@ -40,6 +45,10 @@ struct AnnotationRecord final {
     QuoteAnchor quote;
     std::string layout_version;
     HighlightColor color;
+    std::uint32_t anchor_version = 1;
+    std::optional<std::size_t> text_start;
+    std::optional<std::size_t> text_end;
+    std::string direction = "ltr";
 };
 
 struct UpdateNote final {

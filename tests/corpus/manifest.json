@@ -38,6 +38,18 @@
       "added_by_change": "P1 PDF risk validation"
     },
     {
+      "fixture_id": "generated-selection-complex-v1",
+      "path": "generated/selection-complex.pdf",
+      "document_sha256": "2b3fae55afed4c68a5f8111cfcb9f28f8f786d30638dedc79b0e6107017bad8e",
+      "origin": "scripts/generate-pdf-fixtures.cjs",
+      "license": "LicenseRef-ContextReader-Generated-Fixture",
+      "redistributable": true,
+      "features": ["partial-line", "cross-line", "ligature", "rtl", "vertical-writing", "to-unicode"],
+      "expected_outcome": "opens-with-text-layout",
+      "related_issue": null,
+      "added_by_change": "P4 precise selection"
+    },
+    {
       "fixture_id": "generated-image-only-scan-v1",
       "path": "generated/image-only-scan.pdf",
       "document_sha256": "80fa41d3e3e8de6f3ede4b9dfba21c0c90a142ef3880db61d45144880399f5f5",

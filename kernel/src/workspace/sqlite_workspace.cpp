@@ -2,7 +2,9 @@
 
 #include <windows.h>
 #include <bcrypt.h>
+#include <wincodec.h>
 #include <sqlite3.h>
+#include <miniz.h>
 
 #include <algorithm>
 #include <array>
@@ -23,6 +25,7 @@
 #include <string_view>
 #include <system_error>
 #include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -34,7 +37,7 @@ namespace context_reader {
 
 namespace {
 
-constexpr std::uint32_t current_schema_version = 2;
+constexpr std::uint32_t current_schema_version = 4;
 
 class WorkspaceLock final {
 public:
@@ -290,6 +293,88 @@ private:
     return Result<std::string>::success(hex_string(bytes));
 }
 
+struct ImageMetadata final {
+    std::string media_type;
+    std::string extension;
+    std::uint32_t width;
+    std::uint32_t height;
+};
+
+[[nodiscard]] Result<ImageMetadata> inspect_image(const std::filesystem::path& path) {
+    const auto initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool uninitialize = SUCCEEDED(initialized);
+    if(FAILED(initialized) && initialized != RPC_E_CHANGED_MODE) {
+        return Result<ImageMetadata>::failure(
+            Error(ErrorCode::storage_failure, "Windows Imaging Component could not be initialized")
+        );
+    }
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    const auto release = [&] {
+        if(frame != nullptr) frame->Release();
+        if(decoder != nullptr) decoder->Release();
+        if(factory != nullptr) factory->Release();
+        if(uninitialize) CoUninitialize();
+    };
+    if(FAILED(CoCreateInstance(
+           CLSID_WICImagingFactory,
+           nullptr,
+           CLSCTX_INPROC_SERVER,
+           IID_PPV_ARGS(&factory)
+       )) || FAILED(factory->CreateDecoderFromFilename(
+           path.c_str(),
+           nullptr,
+           GENERIC_READ,
+           WICDecodeMetadataCacheOnLoad,
+           &decoder
+       ))) {
+        release();
+        return Result<ImageMetadata>::failure(
+            Error(ErrorCode::invalid_argument, "Asset is not a decodable PNG or JPEG image")
+        );
+    }
+    GUID container{};
+    UINT width = 0;
+    UINT height = 0;
+    if(FAILED(decoder->GetContainerFormat(&container))
+       || FAILED(decoder->GetFrame(0, &frame))
+       || FAILED(frame->GetSize(&width, &height))) {
+        release();
+        return Result<ImageMetadata>::failure(
+            Error(ErrorCode::invalid_argument, "Asset image metadata could not be read")
+        );
+    }
+    std::string media_type;
+    std::string extension;
+    if(IsEqualGUID(container, GUID_ContainerFormatPng)) {
+        media_type = "image/png";
+        extension = ".png";
+    } else if(IsEqualGUID(container, GUID_ContainerFormatJpeg)) {
+        media_type = "image/jpeg";
+        extension = ".jpg";
+    } else {
+        release();
+        return Result<ImageMetadata>::failure(
+            Error(ErrorCode::invalid_argument, "Only PNG and JPEG note assets are supported")
+        );
+    }
+    if(width == 0 || height == 0 || width > 8192 || height > 8192
+       || static_cast<std::uint64_t>(width) * height > 40'000'000ULL) {
+        release();
+        return Result<ImageMetadata>::failure(
+            Error(ErrorCode::invalid_argument, "Asset image dimensions exceed the supported limits")
+        );
+    }
+    release();
+    return Result<ImageMetadata>::success(ImageMetadata{
+        .media_type = std::move(media_type),
+        .extension = std::move(extension),
+        .width = static_cast<std::uint32_t>(width),
+        .height = static_cast<std::uint32_t>(height),
+    });
+}
+
 [[nodiscard]] Result<void> copy_file_cancellable(
     const std::filesystem::path& source,
     const std::filesystem::path& destination,
@@ -380,7 +465,7 @@ void terminate_at_import_fault_point(std::string_view point) {
 [[nodiscard]] Result<void> execute(sqlite3* database, const char* sql) {
     if(sqlite3_exec(database, sql, nullptr, nullptr, nullptr) != SQLITE_OK) {
         return Result<void>::failure(
-            Error(ErrorCode::storage_failure, "SQLite command failed")
+            Error(ErrorCode::storage_failure, std::string("SQLite command failed: ") + sqlite3_errmsg(database))
         );
     }
     return Result<void>::success();
@@ -390,7 +475,7 @@ void terminate_at_import_fault_point(std::string_view point) {
     Statement statement;
     if(sqlite3_prepare_v2(database, sql, -1, statement.address(), nullptr) != SQLITE_OK) {
         return Result<Statement>::failure(
-            Error(ErrorCode::storage_failure, "SQLite statement preparation failed")
+            Error(ErrorCode::storage_failure, std::string("SQLite statement preparation failed: ") + sqlite3_errmsg(database))
         );
     }
     return Result<Statement>::success(std::move(statement));
@@ -576,6 +661,51 @@ template <typename Id>
     return Result<void>::success();
 }
 
+[[nodiscard]] Result<void> attach_search_index(
+    sqlite3* database,
+    const std::filesystem::path& index_path
+) {
+    std::error_code filesystem_error;
+    if(!std::filesystem::exists(index_path, filesystem_error)) {
+        std::ofstream index_file(index_path, std::ios::binary | std::ios::app);
+        index_file.close();
+        if(filesystem_error || !index_file) {
+            return Result<void>::failure(
+                Error(ErrorCode::storage_failure, "Search index database could not be created")
+            );
+        }
+    }
+    auto attach = prepare(database, "ATTACH DATABASE ?1 AS search_index");
+    const auto path = utf8_path(index_path);
+    if(!attach || !bind_text(attach.value().get(), 1, path)
+       || sqlite3_step(attach.value().get()) != SQLITE_DONE) {
+        return Result<void>::failure(
+            Error(
+                ErrorCode::storage_failure,
+                std::string("Search index database could not be attached: ") + sqlite3_errmsg(database)
+            )
+        );
+    }
+    constexpr const char* schema = R"sql(
+CREATE TABLE IF NOT EXISTS search_index.metadata (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    version INTEGER NOT NULL,
+    status TEXT NOT NULL
+) STRICT;
+INSERT OR IGNORE INTO search_index.metadata(singleton, version, status) VALUES(1, 1, 'not_built');
+CREATE VIRTUAL TABLE IF NOT EXISTS search_index.entries USING fts5(
+    kind UNINDEXED,
+    document_version_id UNINDEXED,
+    note_id UNINDEXED,
+    page_index UNINDEXED,
+    title,
+    content,
+    tokenize='trigram'
+);
+)sql";
+    return execute(database, schema);
+}
+
 [[nodiscard]] Result<std::size_t> query_count(sqlite3* database, const char* sql);
 
 [[nodiscard]] Result<void> apply_initial_migration(sqlite3* database) {
@@ -612,6 +742,10 @@ CREATE TABLE annotations (
     quote_prefix TEXT NOT NULL,
     quote_suffix TEXT NOT NULL,
     layout_version TEXT NOT NULL,
+    anchor_version INTEGER NOT NULL CHECK (anchor_version IN (1, 2)),
+    text_start INTEGER CHECK (text_start IS NULL OR text_start >= 0),
+    text_end INTEGER CHECK (text_end IS NULL OR text_end >= text_start),
+    direction TEXT NOT NULL CHECK (direction IN ('ltr', 'rtl', 'ttb')),
     color TEXT NOT NULL CHECK (color IN ('yellow', 'green', 'blue', 'pink')),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -634,9 +768,24 @@ CREATE TABLE notes (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 ) STRICT;
+CREATE TABLE assets (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+    content_hash TEXT NOT NULL UNIQUE CHECK (length(content_hash) = 64),
+    object_key TEXT NOT NULL UNIQUE,
+    media_type TEXT NOT NULL CHECK (media_type IN ('image/png', 'image/jpeg')),
+    byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+    width INTEGER NOT NULL CHECK (width > 0),
+    height INTEGER NOT NULL CHECK (height > 0),
+    created_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE annotation_assets (
+    annotation_id BLOB NOT NULL REFERENCES annotations(id) ON DELETE CASCADE,
+    asset_id BLOB NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    PRIMARY KEY(annotation_id, asset_id)
+) STRICT;
 INSERT INTO workspace_metadata(singleton, workspace_id, schema_version, created_at)
-VALUES (1, randomblob(16), 2, unixepoch());
-PRAGMA user_version = 2;
+VALUES (1, randomblob(16), 4, unixepoch());
+PRAGMA user_version = 4;
 COMMIT;
 )sql";
 
@@ -655,52 +804,9 @@ COMMIT;
     if(version_result.value() == current_schema_version) {
         return Result<void>::success();
     }
-    if(version_result.value() != 1U) {
-        return Result<void>::failure(
-            Error(ErrorCode::unsupported_document, "Workspace schema version is unsupported")
-        );
-    }
-    constexpr const char* migration = R"sql(
-BEGIN IMMEDIATE;
-CREATE TABLE annotations (
-    id BLOB PRIMARY KEY CHECK (length(id) = 16),
-    document_version_id BLOB NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
-    page_index INTEGER NOT NULL CHECK (page_index >= 0),
-    quote_exact TEXT NOT NULL,
-    quote_prefix TEXT NOT NULL,
-    quote_suffix TEXT NOT NULL,
-    layout_version TEXT NOT NULL,
-    color TEXT NOT NULL CHECK (color IN ('yellow', 'green', 'blue', 'pink')),
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-) STRICT;
-CREATE INDEX annotations_version_page_idx ON annotations(document_version_id, page_index);
-CREATE TABLE annotation_quads (
-    annotation_id BLOB NOT NULL REFERENCES annotations(id) ON DELETE CASCADE,
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    x REAL NOT NULL,
-    y REAL NOT NULL,
-    width REAL NOT NULL CHECK (width > 0),
-    height REAL NOT NULL CHECK (height > 0),
-    PRIMARY KEY(annotation_id, ordinal)
-) STRICT;
-CREATE TABLE notes (
-    id BLOB PRIMARY KEY CHECK (length(id) = 16),
-    annotation_id BLOB NOT NULL UNIQUE REFERENCES annotations(id) ON DELETE CASCADE,
-    markdown_source TEXT NOT NULL,
-    revision INTEGER NOT NULL CHECK (revision > 0),
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-) STRICT;
-UPDATE workspace_metadata SET schema_version = 2 WHERE singleton = 1;
-PRAGMA user_version = 2;
-COMMIT;
-)sql";
-    auto result = execute(database, migration);
-    if(!result) {
-        sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
-    }
-    return result;
+    return Result<void>::failure(
+        Error(ErrorCode::unsupported_document, "Workspace schema version is unsupported in this development build")
+    );
 }
 
 [[nodiscard]] Result<std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)>> open_database(
@@ -724,63 +830,6 @@ COMMIT;
     );
 }
 
-[[nodiscard]] Result<void> create_migration_backup(
-    sqlite3* source,
-    const std::filesystem::path& root,
-    std::size_t source_version
-) {
-    std::error_code filesystem_error;
-    const auto backup_directory = root / "backups";
-    std::filesystem::create_directories(backup_directory, filesystem_error);
-    if(filesystem_error) {
-        return Result<void>::failure(
-            Error(ErrorCode::storage_failure, "Workspace backup directory could not be created")
-        );
-    }
-
-    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::system_clock::now().time_since_epoch()
-                           ).count();
-    const auto backup_path = backup_directory /
-                             ("workspace-v" + std::to_string(source_version) + "-" +
-                              std::to_string(timestamp) + ".db");
-    sqlite3* raw_backup = nullptr;
-    const auto backup_path_utf8 = utf8_path(backup_path);
-    if(sqlite3_open_v2(
-           backup_path_utf8.c_str(),
-           &raw_backup,
-           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_EXCLUSIVE | SQLITE_OPEN_FULLMUTEX,
-           nullptr
-       ) != SQLITE_OK) {
-        if(raw_backup != nullptr) sqlite3_close_v2(raw_backup);
-        return Result<void>::failure(
-            Error(ErrorCode::storage_failure, "Workspace migration backup could not be created")
-        );
-    }
-    std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> destination(
-        raw_backup,
-        sqlite3_close_v2
-    );
-    auto* backup = sqlite3_backup_init(destination.get(), "main", source, "main");
-    if(backup == nullptr) {
-        destination.reset();
-        std::filesystem::remove(backup_path, filesystem_error);
-        return Result<void>::failure(
-            Error(ErrorCode::storage_failure, "Workspace migration backup could not be initialized")
-        );
-    }
-    const auto step_result = sqlite3_backup_step(backup, -1);
-    const auto finish_result = sqlite3_backup_finish(backup);
-    if(step_result != SQLITE_DONE || finish_result != SQLITE_OK) {
-        destination.reset();
-        std::filesystem::remove(backup_path, filesystem_error);
-        return Result<void>::failure(
-            Error(ErrorCode::storage_failure, "Workspace migration backup failed")
-        );
-    }
-    return Result<void>::success();
-}
-
 [[nodiscard]] Result<std::size_t> query_count(sqlite3* database, const char* sql) {
     auto statement_result = prepare(database, sql);
     if(!statement_result) {
@@ -799,6 +848,190 @@ COMMIT;
         );
     }
     return Result<std::size_t>::success(static_cast<std::size_t>(value));
+}
+
+struct PackageManifestEntry final {
+    std::string path;
+    std::string sha256;
+    std::uint64_t size;
+};
+
+struct ParsedPackageManifest final {
+    std::uint32_t version;
+    std::vector<PackageManifestEntry> entries;
+};
+
+[[nodiscard]] bool safe_package_path(std::string_view value) {
+    if(value.empty() || value.front() == '/' || value.find('\\') != std::string_view::npos
+       || value.find(':') != std::string_view::npos) return false;
+    const std::filesystem::path path(value);
+    if(path.is_absolute() || generic_utf8_path(path.lexically_normal()) != value) return false;
+    for(const auto& part : path) {
+        if(part == "." || part == "..") return false;
+    }
+    return value == "workspace.db" || value.starts_with("objects/pdf/")
+        || value.starts_with("objects/assets/");
+}
+
+[[nodiscard]] Result<ParsedPackageManifest> parse_package_manifest(std::string_view json) {
+    if(json.empty() || json.size() > 1024U * 1024U) {
+        return Result<ParsedPackageManifest>::failure(Error(ErrorCode::invalid_argument, "Package manifest size is invalid"));
+    }
+    sqlite3* raw = nullptr;
+    if(sqlite3_open(":memory:", &raw) != SQLITE_OK) {
+        if(raw != nullptr) sqlite3_close(raw);
+        return Result<ParsedPackageManifest>::failure(Error(ErrorCode::resource_exhausted, "Manifest parser could not be created"));
+    }
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> database(raw, sqlite3_close_v2);
+    auto header = prepare(
+        database.get(),
+        "SELECT json_extract(?1, '$.format'), json_extract(?1, '$.version'), json_type(?1, '$.entries') "
+        "WHERE json_valid(?1)"
+    );
+    if(!header || !bind_text(header.value().get(), 1, json)
+       || sqlite3_step(header.value().get()) != SQLITE_ROW) {
+        return Result<ParsedPackageManifest>::failure(Error(ErrorCode::invalid_argument, "Package manifest is not valid JSON"));
+    }
+    const auto* format = reinterpret_cast<const char*>(sqlite3_column_text(header.value().get(), 0));
+    const auto version = sqlite3_column_int64(header.value().get(), 1);
+    const auto* entries_type = reinterpret_cast<const char*>(sqlite3_column_text(header.value().get(), 2));
+    if(format == nullptr || std::string_view(format) != "readerpkg" || version != 1
+       || entries_type == nullptr || std::string_view(entries_type) != "array") {
+        return Result<ParsedPackageManifest>::failure(Error(ErrorCode::invalid_argument, "Package manifest format is unsupported"));
+    }
+    auto rows = prepare(
+        database.get(),
+        "SELECT json_extract(value, '$.path'), json_extract(value, '$.sha256'), "
+        "json_extract(value, '$.size') FROM json_each(?1, '$.entries')"
+    );
+    if(!rows || !bind_text(rows.value().get(), 1, json)) {
+        return Result<ParsedPackageManifest>::failure(Error(ErrorCode::invalid_argument, "Package manifest entries are invalid"));
+    }
+    ParsedPackageManifest manifest{.version = 1};
+    std::unordered_set<std::string> paths;
+    int step = SQLITE_ROW;
+    while((step = sqlite3_step(rows.value().get())) == SQLITE_ROW) {
+        const auto* path = reinterpret_cast<const char*>(sqlite3_column_text(rows.value().get(), 0));
+        const auto* sha = reinterpret_cast<const char*>(sqlite3_column_text(rows.value().get(), 1));
+        const auto size = sqlite3_column_int64(rows.value().get(), 2);
+        if(path == nullptr || sha == nullptr || size < 0 || std::string_view(sha).size() != 64
+           || !safe_package_path(path) || !paths.insert(path).second) {
+            return Result<ParsedPackageManifest>::failure(Error(ErrorCode::invalid_argument, "Package manifest entry is invalid"));
+        }
+        manifest.entries.push_back(PackageManifestEntry{
+            .path = path,
+            .sha256 = sha,
+            .size = static_cast<std::uint64_t>(size),
+        });
+    }
+    if(step != SQLITE_DONE || manifest.entries.empty()) {
+        return Result<ParsedPackageManifest>::failure(Error(ErrorCode::invalid_argument, "Package manifest entries are invalid"));
+    }
+    return Result<ParsedPackageManifest>::success(std::move(manifest));
+}
+
+[[nodiscard]] Result<BackupInspection> validate_and_extract_package(
+    const std::filesystem::path& package_path,
+    const std::filesystem::path& extraction_root
+) {
+    if(!std::filesystem::is_regular_file(package_path)) {
+        return Result<BackupInspection>::failure(Error(ErrorCode::not_found, "Backup package was not found"));
+    }
+    mz_zip_archive archive{};
+    const auto package_utf8 = utf8_path(package_path);
+    if(!mz_zip_reader_init_file(&archive, package_utf8.c_str(), 0)) {
+        return Result<BackupInspection>::failure(Error(ErrorCode::invalid_argument, "Backup is not a readable ZIP archive"));
+    }
+    const auto close_archive = [&] { mz_zip_reader_end(&archive); };
+    if(!mz_zip_is_zip64(&archive)) {
+        close_archive();
+        return Result<BackupInspection>::failure(Error(ErrorCode::invalid_argument, "Backup must use the ZIP64 archive format"));
+    }
+    // Each declared entry is fully inflated below and checked against its manifest
+    // size and SHA-256. miniz 3.1.2's aggregate validator rejects small archives
+    // written with forced ZIP64 even though its reader and external ZIP readers
+    // accept the same archive.
+    const auto file_count = mz_zip_reader_get_num_files(&archive);
+    std::unordered_map<std::string, mz_uint> archive_entries;
+    std::uint64_t total_size = 0;
+    mz_uint manifest_index = 0;
+    bool manifest_found = false;
+    for(mz_uint index = 0; index < file_count; ++index) {
+        mz_zip_archive_file_stat stat{};
+        if(!mz_zip_reader_file_stat(&archive, index, &stat)) {
+            close_archive();
+            return Result<BackupInspection>::failure(Error(ErrorCode::invalid_argument, "Backup entry metadata is invalid"));
+        }
+        const std::string name(stat.m_filename);
+        const auto unix_type = (stat.m_external_attr >> 16U) & 0170000U;
+        if(name.empty() || stat.m_is_directory || stat.m_is_encrypted || !stat.m_is_supported
+           || unix_type == 0120000U || name.find('\\') != std::string::npos
+           || !archive_entries.emplace(name, index).second
+           || stat.m_uncomp_size > 100ULL * 1024ULL * 1024ULL * 1024ULL
+           || total_size > 100ULL * 1024ULL * 1024ULL * 1024ULL - stat.m_uncomp_size) {
+            close_archive();
+            return Result<BackupInspection>::failure(Error(ErrorCode::invalid_argument, "Backup contains an unsafe entry"));
+        }
+        total_size += stat.m_uncomp_size;
+        if(name == "manifest.json") {
+            manifest_found = true;
+            manifest_index = index;
+        }
+    }
+    if(!manifest_found) {
+        close_archive();
+        return Result<BackupInspection>::failure(Error(ErrorCode::invalid_argument, "Backup manifest is missing"));
+    }
+    size_t manifest_size = 0;
+    void* manifest_data = mz_zip_reader_extract_to_heap(&archive, manifest_index, &manifest_size, 0);
+    if(manifest_data == nullptr) {
+        close_archive();
+        return Result<BackupInspection>::failure(Error(ErrorCode::invalid_argument, "Backup manifest could not be read"));
+    }
+    const std::string manifest_json(static_cast<const char*>(manifest_data), manifest_size);
+    mz_free(manifest_data);
+    auto manifest = parse_package_manifest(manifest_json);
+    if(!manifest || manifest.value().entries.size() + 1U != archive_entries.size()) {
+        close_archive();
+        return Result<BackupInspection>::failure(
+            manifest ? Error(ErrorCode::invalid_argument, "Backup contains undeclared files") : manifest.error()
+        );
+    }
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(extraction_root, filesystem_error);
+    if(filesystem_error) {
+        close_archive();
+        return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Backup validation directory could not be created"));
+    }
+    for(const auto& entry : manifest.value().entries) {
+        const auto found = archive_entries.find(entry.path);
+        mz_zip_archive_file_stat stat{};
+        if(found == archive_entries.end() || !mz_zip_reader_file_stat(&archive, found->second, &stat)
+           || stat.m_uncomp_size != entry.size) {
+            close_archive();
+            return Result<BackupInspection>::failure(Error(ErrorCode::invalid_argument, "Backup entry size does not match the manifest"));
+        }
+        const auto destination = extraction_root / std::filesystem::path(entry.path);
+        std::filesystem::create_directories(destination.parent_path(), filesystem_error);
+        const auto destination_utf8 = utf8_path(destination);
+        if(filesystem_error || !mz_zip_reader_extract_to_file(&archive, found->second, destination_utf8.c_str(), 0)) {
+            close_archive();
+            return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Backup entry could not be extracted"));
+        }
+        auto hash = sha256_file(destination);
+        if(!hash || hash.value() != entry.sha256) {
+            close_archive();
+            return Result<BackupInspection>::failure(Error(ErrorCode::invalid_argument, "Backup entry hash does not match the manifest"));
+        }
+    }
+    close_archive();
+    return Result<BackupInspection>::success(BackupInspection{
+        .valid = true,
+        .format_version = 1,
+        .file_count = manifest.value().entries.size(),
+        .total_uncompressed_bytes = total_size,
+        .issues = {},
+    });
 }
 
 }  // namespace
@@ -1097,7 +1330,11 @@ public:
     [[nodiscard]] Result<AnnotationRecord> create_annotation(const CreateAnnotation& command) {
         const std::scoped_lock lock(mutex_);
         if(command.quads.empty() || command.quote.exact.empty() || command.layout_version.empty()
-           || command.page_index > static_cast<std::size_t>(std::numeric_limits<sqlite3_int64>::max())) {
+           || command.page_index > static_cast<std::size_t>(std::numeric_limits<sqlite3_int64>::max())
+           || (command.direction != "ltr" && command.direction != "rtl" && command.direction != "ttb")
+           || (command.anchor_version != 1U && command.anchor_version != 2U)
+           || (command.anchor_version == 2U && (!command.text_start || !command.text_end
+               || *command.text_end <= *command.text_start))) {
             return Result<AnnotationRecord>::failure(
                 Error(ErrorCode::invalid_argument, "Annotation anchor is incomplete")
             );
@@ -1148,8 +1385,9 @@ public:
         auto annotation_insert = prepare(
             database_.get(),
             "INSERT INTO annotations(id, document_version_id, page_index, quote_exact, "
-            "quote_prefix, quote_suffix, layout_version, color, created_at, updated_at) "
-            "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch(), unixepoch())"
+            "quote_prefix, quote_suffix, layout_version, color, anchor_version, text_start, text_end, "
+            "direction, created_at, updated_at) "
+            "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, unixepoch(), unixepoch())"
         );
         if(!annotation_insert || !bind_id(annotation_insert.value().get(), 1, id)
            || !bind_id(annotation_insert.value().get(), 2, command.document_version_id)
@@ -1159,6 +1397,14 @@ public:
            || !bind_text(annotation_insert.value().get(), 6, command.quote.suffix)
            || !bind_text(annotation_insert.value().get(), 7, command.layout_version)
            || !bind_text(annotation_insert.value().get(), 8, color_name(command.color))
+           || sqlite3_bind_int(annotation_insert.value().get(), 9, static_cast<int>(command.anchor_version)) != SQLITE_OK
+           || (command.text_start
+               ? sqlite3_bind_int64(annotation_insert.value().get(), 10, static_cast<sqlite3_int64>(*command.text_start))
+               : sqlite3_bind_null(annotation_insert.value().get(), 10)) != SQLITE_OK
+           || (command.text_end
+               ? sqlite3_bind_int64(annotation_insert.value().get(), 11, static_cast<sqlite3_int64>(*command.text_end))
+               : sqlite3_bind_null(annotation_insert.value().get(), 11)) != SQLITE_OK
+           || !bind_text(annotation_insert.value().get(), 12, command.direction)
            || sqlite3_step(annotation_insert.value().get()) != SQLITE_DONE) {
             return Result<AnnotationRecord>::failure(
                 Error(ErrorCode::storage_failure, "Annotation could not be inserted")
@@ -1203,6 +1449,10 @@ public:
             .quote = command.quote,
             .layout_version = command.layout_version,
             .color = command.color,
+            .anchor_version = command.anchor_version,
+            .text_start = command.text_start,
+            .text_end = command.text_end,
+            .direction = command.direction,
         });
     }
 
@@ -1213,7 +1463,8 @@ public:
         auto annotations_result = prepare(
             database_.get(),
             "SELECT id, document_version_id, page_index, quote_exact, quote_prefix, quote_suffix, "
-            "layout_version, color FROM annotations WHERE document_version_id = ?1 "
+            "layout_version, color, anchor_version, text_start, text_end, direction "
+            "FROM annotations WHERE document_version_id = ?1 "
             "ORDER BY page_index, created_at, rowid"
         );
         if(!annotations_result || !bind_id(annotations_result.value().get(), 1, document_version_id)) {
@@ -1233,8 +1484,13 @@ public:
             const auto* suffix = reinterpret_cast<const char*>(sqlite3_column_text(annotations.get(), 5));
             const auto* layout = reinterpret_cast<const char*>(sqlite3_column_text(annotations.get(), 6));
             const auto* color_text = reinterpret_cast<const char*>(sqlite3_column_text(annotations.get(), 7));
+            const auto anchor_version = sqlite3_column_int64(annotations.get(), 8);
+            const auto text_start = sqlite3_column_int64(annotations.get(), 9);
+            const auto text_end = sqlite3_column_int64(annotations.get(), 10);
+            const auto* direction = reinterpret_cast<const char*>(sqlite3_column_text(annotations.get(), 11));
             if(!id || !version_id || page_index < 0 || exact == nullptr || prefix == nullptr
-               || suffix == nullptr || layout == nullptr || color_text == nullptr) {
+               || suffix == nullptr || layout == nullptr || color_text == nullptr || direction == nullptr
+               || (anchor_version != 1 && anchor_version != 2)) {
                 return Result<std::vector<AnnotationRecord>>::failure(
                     Error(ErrorCode::storage_failure, "SQLite annotation record is invalid")
                 );
@@ -1275,6 +1531,12 @@ public:
                 .quote = QuoteAnchor{.exact = exact, .prefix = prefix, .suffix = suffix},
                 .layout_version = layout,
                 .color = color.value(),
+                .anchor_version = static_cast<std::uint32_t>(anchor_version),
+                .text_start = sqlite3_column_type(annotations.get(), 9) == SQLITE_NULL
+                    ? std::nullopt : std::optional<std::size_t>(static_cast<std::size_t>(text_start)),
+                .text_end = sqlite3_column_type(annotations.get(), 10) == SQLITE_NULL
+                    ? std::nullopt : std::optional<std::size_t>(static_cast<std::size_t>(text_end)),
+                .direction = direction,
             });
         }
         if(step_result != SQLITE_DONE) {
@@ -1287,6 +1549,10 @@ public:
 
     [[nodiscard]] Result<void> delete_annotation(AnnotationId annotation_id) {
         const std::scoped_lock lock(mutex_);
+        Transaction transaction(database_.get());
+        const auto begin = execute(database_.get(), "BEGIN IMMEDIATE");
+        if(!begin) return begin;
+        transaction.begin();
         auto statement_result = prepare(database_.get(), "DELETE FROM annotations WHERE id = ?1");
         if(!statement_result || !bind_id(statement_result.value().get(), 1, annotation_id)
            || sqlite3_step(statement_result.value().get()) != SQLITE_DONE) {
@@ -1296,6 +1562,17 @@ public:
         }
         if(sqlite3_changes(database_.get()) != 1) {
             return Result<void>::failure(Error(ErrorCode::not_found, "Annotation was not found"));
+        }
+        std::vector<std::filesystem::path> reclaimed_assets;
+        const auto synchronize = synchronize_note_assets(annotation_id, "", reclaimed_assets);
+        if(!synchronize) return synchronize;
+        const auto commit = execute(database_.get(), "COMMIT");
+        if(!commit) return commit;
+        transaction.commit();
+        std::error_code filesystem_error;
+        for(const auto& path : reclaimed_assets) {
+            std::filesystem::remove(path, filesystem_error);
+            filesystem_error.clear();
         }
         return Result<void>::success();
     }
@@ -1327,6 +1604,7 @@ public:
             return Result<NoteRecord>::failure(begin_result.error());
         }
         transaction.begin();
+        std::vector<std::filesystem::path> reclaimed_assets;
 
         if(sqlite3_column_type(lookup.get(), 0) == SQLITE_NULL) {
             if(command.expected_revision != 0U) {
@@ -1351,6 +1629,12 @@ public:
                     Error(ErrorCode::storage_failure, "Note could not be created")
                 );
             }
+            auto assets = synchronize_note_assets(
+                command.annotation_id,
+                command.markdown_source,
+                reclaimed_assets
+            );
+            if(!assets) return Result<NoteRecord>::failure(assets.error());
             auto fault = fail_at_fault_point(
                 "CONTEXT_READER_TEST_AUTOSAVE_FAULT",
                 "before-commit",
@@ -1360,6 +1644,10 @@ public:
             auto commit_result = execute(database_.get(), "COMMIT");
             if(!commit_result) return Result<NoteRecord>::failure(commit_result.error());
             transaction.commit();
+            for(const auto& path : reclaimed_assets) {
+                std::error_code ignored;
+                std::filesystem::remove(path, ignored);
+            }
             fault = fail_at_fault_point(
                 "CONTEXT_READER_TEST_AUTOSAVE_FAULT",
                 "after-commit",
@@ -1398,6 +1686,12 @@ public:
                 Error(ErrorCode::conflict, "Note revision does not match")
             );
         }
+        auto assets = synchronize_note_assets(
+            command.annotation_id,
+            command.markdown_source,
+            reclaimed_assets
+        );
+        if(!assets) return Result<NoteRecord>::failure(assets.error());
         auto fault = fail_at_fault_point(
             "CONTEXT_READER_TEST_AUTOSAVE_FAULT",
             "before-commit",
@@ -1407,6 +1701,10 @@ public:
         auto commit_result = execute(database_.get(), "COMMIT");
         if(!commit_result) return Result<NoteRecord>::failure(commit_result.error());
         transaction.commit();
+        for(const auto& path : reclaimed_assets) {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
         fault = fail_at_fault_point(
             "CONTEXT_READER_TEST_AUTOSAVE_FAULT",
             "after-commit",
@@ -1462,6 +1760,508 @@ public:
             );
         }
         return Result<std::vector<NoteRecord>>::success(std::move(notes));
+    }
+
+    [[nodiscard]] Result<AssetRecord> import_note_asset(
+        AnnotationId annotation_id,
+        const std::filesystem::path& source,
+        const CancellationToken& cancellation
+    ) {
+        const std::scoped_lock lock(mutex_);
+        if(cancellation.is_cancellation_requested()) {
+            return Result<AssetRecord>::failure(Error(ErrorCode::cancelled, "Asset import was cancelled"));
+        }
+        std::error_code filesystem_error;
+        if(!std::filesystem::is_regular_file(source, filesystem_error) || filesystem_error) {
+            return Result<AssetRecord>::failure(Error(ErrorCode::not_found, "Asset source file was not found"));
+        }
+        const auto byte_length = std::filesystem::file_size(source, filesystem_error);
+        if(filesystem_error || byte_length == 0 || byte_length > 10ULL * 1024ULL * 1024ULL) {
+            return Result<AssetRecord>::failure(
+                Error(ErrorCode::invalid_argument, "Asset byte length exceeds the supported limit")
+            );
+        }
+        auto metadata = inspect_image(source);
+        if(!metadata) return Result<AssetRecord>::failure(metadata.error());
+        auto annotation_lookup = prepare(database_.get(), "SELECT 1 FROM annotations WHERE id = ?1");
+        if(!annotation_lookup || !bind_id(annotation_lookup.value().get(), 1, annotation_id)
+           || sqlite3_step(annotation_lookup.value().get()) != SQLITE_ROW) {
+            return Result<AssetRecord>::failure(Error(ErrorCode::not_found, "Annotation was not found"));
+        }
+        auto hash = sha256_file(source, cancellation);
+        if(!hash) return Result<AssetRecord>::failure(hash.error());
+
+        std::optional<AssetRecord> record;
+        std::string object_key;
+        bool new_asset = false;
+        auto existing = prepare(
+            database_.get(),
+            "SELECT id, content_hash, object_key, media_type, byte_length, width, height "
+            "FROM assets WHERE content_hash = ?1"
+        );
+        if(!existing || !bind_text(existing.value().get(), 1, hash.value())) {
+            return Result<AssetRecord>::failure(Error(ErrorCode::storage_failure, "Asset lookup failed"));
+        }
+        const auto existing_step = sqlite3_step(existing.value().get());
+        if(existing_step == SQLITE_ROW) {
+            auto id = read_id<AssetId>(existing.value().get(), 0);
+            const auto* stored_hash = reinterpret_cast<const char*>(sqlite3_column_text(existing.value().get(), 1));
+            const auto* stored_key = reinterpret_cast<const char*>(sqlite3_column_text(existing.value().get(), 2));
+            const auto* media_type = reinterpret_cast<const char*>(sqlite3_column_text(existing.value().get(), 3));
+            if(!id || stored_hash == nullptr || stored_key == nullptr || media_type == nullptr) {
+                return Result<AssetRecord>::failure(Error(ErrorCode::storage_failure, "Stored asset is invalid"));
+            }
+            object_key = stored_key;
+            record = AssetRecord{
+                .id = id.value(),
+                .content_sha256 = stored_hash,
+                .media_type = media_type,
+                .byte_length = static_cast<std::uint64_t>(sqlite3_column_int64(existing.value().get(), 4)),
+                .width = static_cast<std::uint32_t>(sqlite3_column_int64(existing.value().get(), 5)),
+                .height = static_cast<std::uint32_t>(sqlite3_column_int64(existing.value().get(), 6)),
+            };
+        } else if(existing_step == SQLITE_DONE) {
+            auto id = create_id<AssetId>(database_.get());
+            if(!id) return Result<AssetRecord>::failure(id.error());
+            object_key = generic_utf8_path(
+                std::filesystem::path("objects") / "assets" / hash.value().substr(0, 2) /
+                (hash.value() + metadata.value().extension)
+            );
+            const auto object_path = root_ / std::filesystem::path(object_key);
+            std::filesystem::create_directories(object_path.parent_path(), filesystem_error);
+            if(filesystem_error) {
+                return Result<AssetRecord>::failure(Error(ErrorCode::storage_failure, "Asset object directory could not be created"));
+            }
+            auto copied = copy_file_cancellable(source, object_path, cancellation);
+            if(!copied) return Result<AssetRecord>::failure(copied.error());
+            new_asset = true;
+            record = AssetRecord{
+                .id = id.value(),
+                .content_sha256 = hash.value(),
+                .media_type = metadata.value().media_type,
+                .byte_length = static_cast<std::uint64_t>(byte_length),
+                .width = metadata.value().width,
+                .height = metadata.value().height,
+            };
+        } else {
+            return Result<AssetRecord>::failure(Error(ErrorCode::storage_failure, "Asset lookup failed"));
+        }
+
+        Transaction transaction(database_.get());
+        auto begin = execute(database_.get(), "BEGIN IMMEDIATE");
+        if(!begin) return Result<AssetRecord>::failure(begin.error());
+        transaction.begin();
+        if(new_asset) {
+            auto insert = prepare(
+                database_.get(),
+                "INSERT INTO assets(id, content_hash, object_key, media_type, byte_length, width, height, created_at) "
+                "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch())"
+            );
+            if(!insert || !bind_id(insert.value().get(), 1, record->id)
+               || !bind_text(insert.value().get(), 2, record->content_sha256)
+               || !bind_text(insert.value().get(), 3, object_key)
+               || !bind_text(insert.value().get(), 4, record->media_type)
+               || sqlite3_bind_int64(insert.value().get(), 5, static_cast<sqlite3_int64>(record->byte_length)) != SQLITE_OK
+               || sqlite3_bind_int64(insert.value().get(), 6, record->width) != SQLITE_OK
+               || sqlite3_bind_int64(insert.value().get(), 7, record->height) != SQLITE_OK
+               || sqlite3_step(insert.value().get()) != SQLITE_DONE) {
+                std::filesystem::remove(root_ / std::filesystem::path(object_key), filesystem_error);
+                return Result<AssetRecord>::failure(Error(ErrorCode::storage_failure, "Asset record could not be inserted"));
+            }
+        }
+        auto associate = prepare(
+            database_.get(),
+            "INSERT OR IGNORE INTO annotation_assets(annotation_id, asset_id) VALUES(?1, ?2)"
+        );
+        if(!associate || !bind_id(associate.value().get(), 1, annotation_id)
+           || !bind_id(associate.value().get(), 2, record->id)
+           || sqlite3_step(associate.value().get()) != SQLITE_DONE) {
+            return Result<AssetRecord>::failure(Error(ErrorCode::storage_failure, "Asset could not be associated with the annotation"));
+        }
+        auto commit = execute(database_.get(), "COMMIT");
+        if(!commit) return Result<AssetRecord>::failure(commit.error());
+        transaction.commit();
+        return Result<AssetRecord>::success(std::move(*record));
+    }
+
+    [[nodiscard]] Result<AssetData> read_asset(AssetId asset_id) {
+        const std::scoped_lock lock(mutex_);
+        auto lookup = prepare(
+            database_.get(),
+            "SELECT content_hash, object_key, media_type, byte_length, width, height FROM assets WHERE id = ?1"
+        );
+        if(!lookup || !bind_id(lookup.value().get(), 1, asset_id)) {
+            return Result<AssetData>::failure(Error(ErrorCode::storage_failure, "Asset lookup failed"));
+        }
+        const auto step = sqlite3_step(lookup.value().get());
+        if(step == SQLITE_DONE) return Result<AssetData>::failure(Error(ErrorCode::not_found, "Asset was not found"));
+        const auto* hash = reinterpret_cast<const char*>(sqlite3_column_text(lookup.value().get(), 0));
+        const auto* object_key = reinterpret_cast<const char*>(sqlite3_column_text(lookup.value().get(), 1));
+        const auto* media_type = reinterpret_cast<const char*>(sqlite3_column_text(lookup.value().get(), 2));
+        const auto byte_length = sqlite3_column_int64(lookup.value().get(), 3);
+        if(step != SQLITE_ROW || hash == nullptr || object_key == nullptr || media_type == nullptr
+           || byte_length < 0 || byte_length > 10LL * 1024LL * 1024LL) {
+            return Result<AssetData>::failure(Error(ErrorCode::storage_failure, "Stored asset is invalid"));
+        }
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(byte_length));
+        std::ifstream input(root_ / std::filesystem::path(object_key), std::ios::binary);
+        if(!input || (byte_length > 0 && !input.read(
+            reinterpret_cast<char*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size())
+        ))) {
+            return Result<AssetData>::failure(Error(ErrorCode::storage_failure, "Asset object could not be read"));
+        }
+        return Result<AssetData>::success(AssetData{
+            .asset = AssetRecord{
+                .id = asset_id,
+                .content_sha256 = hash,
+                .media_type = media_type,
+                .byte_length = static_cast<std::uint64_t>(byte_length),
+                .width = static_cast<std::uint32_t>(sqlite3_column_int64(lookup.value().get(), 4)),
+                .height = static_cast<std::uint32_t>(sqlite3_column_int64(lookup.value().get(), 5)),
+            },
+            .bytes = std::move(bytes),
+        });
+    }
+
+    [[nodiscard]] Result<BackupInspection> export_package(
+        const std::filesystem::path& destination,
+        const CancellationToken& cancellation
+    ) {
+        const std::scoped_lock lock(mutex_);
+        if(destination.empty() || cancellation.is_cancellation_requested()) {
+            return Result<BackupInspection>::failure(
+                Error(cancellation.is_cancellation_requested() ? ErrorCode::cancelled : ErrorCode::invalid_argument,
+                      cancellation.is_cancellation_requested() ? "Workspace export was cancelled" : "Backup destination is empty")
+            );
+        }
+        std::error_code filesystem_error;
+        if(std::filesystem::exists(destination, filesystem_error)) {
+            return Result<BackupInspection>::failure(Error(ErrorCode::already_exists, "Backup destination already exists"));
+        }
+        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        const auto temporary_root = root_ / "backups" / (".readerpkg-" + std::to_string(stamp));
+        std::filesystem::create_directories(temporary_root, filesystem_error);
+        const auto cleanup = [&] {
+            std::error_code ignored;
+            std::filesystem::remove_all(temporary_root, ignored);
+        };
+        if(filesystem_error) {
+            return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Backup staging directory could not be created"));
+        }
+        const auto snapshot_path = temporary_root / "workspace.db";
+        sqlite3* raw_snapshot = nullptr;
+        const auto snapshot_utf8 = utf8_path(snapshot_path);
+        if(sqlite3_open_v2(
+               snapshot_utf8.c_str(),
+               &raw_snapshot,
+               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_EXCLUSIVE | SQLITE_OPEN_FULLMUTEX,
+               nullptr
+           ) != SQLITE_OK) {
+            if(raw_snapshot != nullptr) sqlite3_close_v2(raw_snapshot);
+            cleanup();
+            return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Workspace snapshot could not be created"));
+        }
+        std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> snapshot(raw_snapshot, sqlite3_close_v2);
+        auto* backup = sqlite3_backup_init(snapshot.get(), "main", database_.get(), "main");
+        const auto backup_step = backup == nullptr ? SQLITE_ERROR : sqlite3_backup_step(backup, -1);
+        const auto backup_finish = backup == nullptr ? SQLITE_ERROR : sqlite3_backup_finish(backup);
+        snapshot.reset();
+        if(backup_step != SQLITE_DONE || backup_finish != SQLITE_OK) {
+            cleanup();
+            return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Workspace snapshot failed"));
+        }
+
+        std::vector<std::pair<std::string, std::filesystem::path>> sources{
+            {"workspace.db", snapshot_path},
+        };
+        auto objects = prepare(
+            database_.get(),
+            "SELECT object_key FROM document_versions UNION SELECT object_key FROM assets ORDER BY object_key"
+        );
+        if(!objects) {
+            cleanup();
+            return Result<BackupInspection>::failure(objects.error());
+        }
+        int step = SQLITE_ROW;
+        while((step = sqlite3_step(objects.value().get())) == SQLITE_ROW) {
+            const auto* key = reinterpret_cast<const char*>(sqlite3_column_text(objects.value().get(), 0));
+            if(key == nullptr || !safe_package_path(key)) {
+                cleanup();
+                return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Workspace object key is unsafe"));
+            }
+            sources.emplace_back(key, root_ / std::filesystem::path(key));
+        }
+        if(step != SQLITE_DONE) {
+            cleanup();
+            return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Workspace objects could not be listed"));
+        }
+
+        std::vector<PackageManifestEntry> entries;
+        entries.reserve(sources.size());
+        std::uint64_t total_size = 0;
+        for(const auto& [archive_path, source_path] : sources) {
+            if(cancellation.is_cancellation_requested()) {
+                cleanup();
+                return Result<BackupInspection>::failure(Error(ErrorCode::cancelled, "Workspace export was cancelled"));
+            }
+            const auto size = std::filesystem::file_size(source_path, filesystem_error);
+            auto hash = sha256_file(source_path, cancellation);
+            if(filesystem_error || !hash || size > std::numeric_limits<std::uint64_t>::max() - total_size) {
+                cleanup();
+                return Result<BackupInspection>::failure(
+                    hash ? Error(ErrorCode::storage_failure, "Workspace object metadata could not be read") : hash.error()
+                );
+            }
+            total_size += static_cast<std::uint64_t>(size);
+            entries.push_back(PackageManifestEntry{
+                .path = archive_path,
+                .sha256 = hash.value(),
+                .size = static_cast<std::uint64_t>(size),
+            });
+        }
+        const auto manifest_path = temporary_root / "manifest.json";
+        std::ofstream manifest(manifest_path, std::ios::binary | std::ios::trunc);
+        manifest << "{\"format\":\"readerpkg\",\"version\":1,\"entries\":[";
+        for(std::size_t index = 0; index < entries.size(); ++index) {
+            if(index != 0) manifest << ',';
+            manifest << "{\"path\":\"" << entries[index].path
+                     << "\",\"sha256\":\"" << entries[index].sha256
+                     << "\",\"size\":" << entries[index].size << '}';
+        }
+        manifest << "]}";
+        manifest.close();
+        if(!manifest) {
+            cleanup();
+            return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Backup manifest could not be written"));
+        }
+
+        auto partial = destination;
+        partial += ".partial";
+        std::filesystem::remove(partial, filesystem_error);
+        mz_zip_archive archive{};
+        const auto partial_utf8 = utf8_path(partial);
+        if(!mz_zip_writer_init_file_v2(&archive, partial_utf8.c_str(), 0, MZ_ZIP_FLAG_WRITE_ZIP64)) {
+            cleanup();
+            return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Backup archive could not be created"));
+        }
+        const auto manifest_utf8 = utf8_path(manifest_path);
+        bool written = mz_zip_writer_add_file(
+            &archive, "manifest.json", manifest_utf8.c_str(), nullptr, 0, MZ_BEST_COMPRESSION
+        ) != 0;
+        for(std::size_t index = 0; written && index < sources.size(); ++index) {
+            const auto source_utf8 = utf8_path(sources[index].second);
+            written = mz_zip_writer_add_file(
+                &archive,
+                sources[index].first.c_str(),
+                source_utf8.c_str(),
+                nullptr,
+                0,
+                MZ_BEST_COMPRESSION
+            ) != 0;
+        }
+        written = written && mz_zip_writer_finalize_archive(&archive) != 0;
+        const auto ended = mz_zip_writer_end(&archive) != 0;
+        cleanup();
+        if(!written || !ended) {
+            std::filesystem::remove(partial, filesystem_error);
+            return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Backup archive could not be finalized"));
+        }
+        std::filesystem::rename(partial, destination, filesystem_error);
+        if(filesystem_error) {
+            std::filesystem::remove(partial, filesystem_error);
+            return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Backup archive could not be committed"));
+        }
+        return Result<BackupInspection>::success(BackupInspection{
+            .valid = true,
+            .format_version = 1,
+            .file_count = entries.size(),
+            .total_uncompressed_bytes = total_size,
+            .issues = {},
+        });
+    }
+
+    [[nodiscard]] Result<void> rebuild_search_index(const CancellationToken& cancellation) {
+        const std::scoped_lock lock(mutex_);
+        if(cancellation.is_cancellation_requested()) {
+            return Result<void>::failure(Error(ErrorCode::cancelled, "Search index rebuild was cancelled"));
+        }
+        Transaction transaction(database_.get());
+        auto begin = execute(database_.get(), "BEGIN IMMEDIATE");
+        if(!begin) return begin;
+        transaction.begin();
+        if(!execute(database_.get(), "UPDATE search_index.metadata SET status = 'building' WHERE singleton = 1")
+           || !execute(database_.get(), "DELETE FROM search_index.entries")) {
+            return Result<void>::failure(Error(ErrorCode::storage_failure, "Search index could not be reset"));
+        }
+        auto insert = prepare(
+            database_.get(),
+            "INSERT INTO search_index.entries(kind, document_version_id, note_id, page_index, title, content) "
+            "VALUES(?1, ?2, ?3, ?4, ?5, ?6)"
+        );
+        auto documents = prepare(
+            database_.get(),
+            "SELECT v.id, d.title, v.object_key, v.page_count FROM documents d "
+            "JOIN document_versions v ON v.id = d.active_version_id ORDER BY d.rowid"
+        );
+        if(!insert || !documents) {
+            return Result<void>::failure(Error(ErrorCode::storage_failure, "Search index statements could not be prepared"));
+        }
+        int step = SQLITE_ROW;
+        while((step = sqlite3_step(documents.value().get())) == SQLITE_ROW) {
+            if(cancellation.is_cancellation_requested()) {
+                return Result<void>::failure(Error(ErrorCode::cancelled, "Search index rebuild was cancelled"));
+            }
+            auto version_id = read_id<DocumentVersionId>(documents.value().get(), 0);
+            const auto* title = reinterpret_cast<const char*>(sqlite3_column_text(documents.value().get(), 1));
+            const auto* object_key = reinterpret_cast<const char*>(sqlite3_column_text(documents.value().get(), 2));
+            const auto page_count = sqlite3_column_int64(documents.value().get(), 3);
+            if(!version_id || title == nullptr || object_key == nullptr || page_count < 0) {
+                return Result<void>::failure(Error(ErrorCode::storage_failure, "Search source metadata is invalid"));
+            }
+            auto opened = pdf_engine_.open(root_ / std::filesystem::path(object_key));
+            if(!opened) return Result<void>::failure(opened.error());
+            for(std::size_t page_index = 0; page_index < static_cast<std::size_t>(page_count); ++page_index) {
+                if(cancellation.is_cancellation_requested()) {
+                    return Result<void>::failure(Error(ErrorCode::cancelled, "Search index rebuild was cancelled"));
+                }
+                auto page_text = opened.value()->extract_text(page_index);
+                if(!page_text) return Result<void>::failure(page_text.error());
+                auto* statement = insert.value().get();
+                sqlite3_reset(statement);
+                sqlite3_clear_bindings(statement);
+                const auto page_text_index = std::to_string(page_index);
+                const auto version_hex = stable_id_to_hex(version_id.value());
+                if(!bind_text(statement, 1, "pdf") || !bind_text(statement, 2, version_hex)
+                   || !bind_text(statement, 3, "") || !bind_text(statement, 4, page_text_index)
+                   || !bind_text(statement, 5, title) || !bind_text(statement, 6, page_text.value().text)
+                   || sqlite3_step(statement) != SQLITE_DONE) {
+                    return Result<void>::failure(Error(ErrorCode::storage_failure, "PDF search entry could not be indexed"));
+                }
+            }
+        }
+        if(step != SQLITE_DONE) {
+            return Result<void>::failure(Error(ErrorCode::storage_failure, "Search source documents could not be listed"));
+        }
+
+        auto notes = prepare(
+            database_.get(),
+            "SELECT n.id, a.document_version_id, a.page_index, d.title, n.markdown_source FROM notes n "
+            "JOIN annotations a ON a.id = n.annotation_id "
+            "JOIN document_versions v ON v.id = a.document_version_id "
+            "JOIN documents d ON d.id = v.document_id ORDER BY n.rowid"
+        );
+        if(!notes) return Result<void>::failure(notes.error());
+        while((step = sqlite3_step(notes.value().get())) == SQLITE_ROW) {
+            auto note_id = read_id<NoteId>(notes.value().get(), 0);
+            auto version_id = read_id<DocumentVersionId>(notes.value().get(), 1);
+            const auto page_index = sqlite3_column_int64(notes.value().get(), 2);
+            const auto* title = reinterpret_cast<const char*>(sqlite3_column_text(notes.value().get(), 3));
+            const auto* markdown = reinterpret_cast<const char*>(sqlite3_column_text(notes.value().get(), 4));
+            if(!note_id || !version_id || page_index < 0 || title == nullptr || markdown == nullptr) {
+                return Result<void>::failure(Error(ErrorCode::storage_failure, "Note search source is invalid"));
+            }
+            auto* statement = insert.value().get();
+            sqlite3_reset(statement);
+            sqlite3_clear_bindings(statement);
+            const auto page_text_index = std::to_string(page_index);
+            const auto version_hex = stable_id_to_hex(version_id.value());
+            const auto note_hex = stable_id_to_hex(note_id.value());
+            if(!bind_text(statement, 1, "note") || !bind_text(statement, 2, version_hex)
+               || !bind_text(statement, 3, note_hex) || !bind_text(statement, 4, page_text_index)
+               || !bind_text(statement, 5, title) || !bind_text(statement, 6, markdown)
+               || sqlite3_step(statement) != SQLITE_DONE) {
+                return Result<void>::failure(Error(ErrorCode::storage_failure, "Note search entry could not be indexed"));
+            }
+        }
+        if(step != SQLITE_DONE
+           || !execute(database_.get(), "UPDATE search_index.metadata SET version = 1, status = 'ready' WHERE singleton = 1")) {
+            return Result<void>::failure(Error(ErrorCode::storage_failure, "Search index could not be finalized"));
+        }
+        auto commit = execute(database_.get(), "COMMIT");
+        if(!commit) return commit;
+        transaction.commit();
+        return Result<void>::success();
+    }
+
+    [[nodiscard]] Result<SearchResponse> search(std::string_view query, std::size_t limit) {
+        const std::scoped_lock lock(mutex_);
+        if(query.empty() || query.size() > 1024 || limit == 0 || limit > 200) {
+            return Result<SearchResponse>::failure(
+                Error(ErrorCode::invalid_argument, "Search query or limit is outside the supported range")
+            );
+        }
+        auto status_statement = prepare(database_.get(), "SELECT status FROM search_index.metadata WHERE singleton = 1");
+        if(!status_statement || sqlite3_step(status_statement.value().get()) != SQLITE_ROW) {
+            return Result<SearchResponse>::failure(Error(ErrorCode::storage_failure, "Search index status is unavailable"));
+        }
+        const auto* status_text = reinterpret_cast<const char*>(sqlite3_column_text(status_statement.value().get(), 0));
+        SearchResponse response{.index_status = status_text == nullptr ? "not_built" : status_text};
+        if(response.index_status != "ready") {
+            return Result<SearchResponse>::success(std::move(response));
+        }
+        const auto unicode_length = static_cast<std::size_t>(std::count_if(
+            query.begin(), query.end(), [](unsigned char byte) { return (byte & 0xC0U) != 0x80U; }
+        ));
+        const bool short_query = unicode_length <= 2;
+        const char* sql = short_query
+            ? "SELECT kind, document_version_id, note_id, page_index, title, "
+              "substr(content, max(1, instr(lower(content), lower(?1)) - 40), 160) "
+              "FROM search_index.entries WHERE instr(lower(content), lower(?1)) > 0 LIMIT ?2"
+            : "SELECT kind, document_version_id, note_id, page_index, title, "
+              "substr(content, max(1, instr(lower(content), lower(?2)) - 40), 160) "
+              "FROM search_index.entries WHERE entries MATCH ?1 LIMIT ?3";
+        auto statement_result = prepare(database_.get(), sql);
+        if(!statement_result) return Result<SearchResponse>::failure(statement_result.error());
+        auto statement = std::move(statement_result).value();
+        std::string match_query;
+        if(short_query) {
+            if(!bind_text(statement.get(), 1, query)
+               || sqlite3_bind_int64(statement.get(), 2, static_cast<sqlite3_int64>(limit)) != SQLITE_OK) {
+                return Result<SearchResponse>::failure(Error(ErrorCode::storage_failure, "Search query could not be bound"));
+            }
+        } else {
+            match_query.push_back('"');
+            for(const auto character : query) {
+                if(character == '"') match_query.push_back('"');
+                match_query.push_back(character);
+            }
+            match_query.push_back('"');
+            if(!bind_text(statement.get(), 1, match_query) || !bind_text(statement.get(), 2, query)
+               || sqlite3_bind_int64(statement.get(), 3, static_cast<sqlite3_int64>(limit)) != SQLITE_OK) {
+                return Result<SearchResponse>::failure(Error(ErrorCode::storage_failure, "Search query could not be bound"));
+            }
+        }
+        int step_result = SQLITE_ROW;
+        while((step_result = sqlite3_step(statement.get())) == SQLITE_ROW) {
+            const auto* kind = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 0));
+            const auto* version = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 1));
+            const auto* note = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 2));
+            const auto* page = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 3));
+            const auto* title = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 4));
+            const auto* excerpt = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 5));
+            const auto version_id = version == nullptr ? std::nullopt : stable_id_from_hex<DocumentVersionIdTag>(version);
+            if(kind == nullptr || !version_id || page == nullptr || title == nullptr || excerpt == nullptr) {
+                return Result<SearchResponse>::failure(Error(ErrorCode::storage_failure, "Search index entry is invalid"));
+            }
+            SearchResultItem item{
+                .kind = std::string_view(kind) == "note" ? SearchResultKind::note : SearchResultKind::pdf_page,
+                .document_version_id = *version_id,
+                .page_index = static_cast<std::size_t>(std::strtoull(page, nullptr, 10)),
+                .title = title,
+                .excerpt = excerpt,
+            };
+            if(note != nullptr && *note != '\0') {
+                item.note_id = stable_id_from_hex<NoteIdTag>(note);
+            }
+            response.results.push_back(std::move(item));
+        }
+        if(step_result != SQLITE_DONE) {
+            return Result<SearchResponse>::failure(Error(ErrorCode::storage_failure, "Search query failed"));
+        }
+        return Result<SearchResponse>::success(std::move(response));
     }
 
     [[nodiscard]] Result<WorkspaceVerification> verify() {
@@ -1702,6 +2502,79 @@ private:
         return Result<std::vector<std::filesystem::path>>::success(std::move(orphaned));
     }
 
+    [[nodiscard]] Result<void> synchronize_note_assets(
+        AnnotationId annotation_id,
+        std::string_view markdown,
+        std::vector<std::filesystem::path>& reclaimed
+    ) {
+        std::vector<AssetId> referenced;
+        std::unordered_set<std::string> unique;
+        constexpr std::string_view prefix = "reader-asset:";
+        std::size_t offset = 0;
+        while((offset = markdown.find(prefix, offset)) != std::string_view::npos) {
+            const auto id_start = offset + prefix.size();
+            if(id_start + 32 > markdown.size()) {
+                return Result<void>::failure(Error(ErrorCode::invalid_argument, "Note contains an invalid reader-asset reference"));
+            }
+            const auto text = markdown.substr(id_start, 32);
+            auto id = stable_id_from_hex<AssetIdTag>(text);
+            if(!id) {
+                return Result<void>::failure(Error(ErrorCode::invalid_argument, "Note contains an invalid reader-asset reference"));
+            }
+            const auto key = std::string(text);
+            if(unique.insert(key).second) referenced.push_back(*id);
+            offset = id_start + 32;
+        }
+        auto exists = prepare(database_.get(), "SELECT 1 FROM assets WHERE id = ?1");
+        if(!exists) return Result<void>::failure(exists.error());
+        for(const auto& id : referenced) {
+            auto* statement = exists.value().get();
+            sqlite3_reset(statement);
+            sqlite3_clear_bindings(statement);
+            if(!bind_id(statement, 1, id) || sqlite3_step(statement) != SQLITE_ROW) {
+                return Result<void>::failure(Error(ErrorCode::invalid_argument, "Note references an unknown Asset ID"));
+            }
+        }
+        auto remove_links = prepare(database_.get(), "DELETE FROM annotation_assets WHERE annotation_id = ?1");
+        if(!remove_links || !bind_id(remove_links.value().get(), 1, annotation_id)
+           || sqlite3_step(remove_links.value().get()) != SQLITE_DONE) {
+            return Result<void>::failure(Error(ErrorCode::storage_failure, "Note asset references could not be reset"));
+        }
+        auto insert_link = prepare(
+            database_.get(),
+            "INSERT INTO annotation_assets(annotation_id, asset_id) VALUES(?1, ?2)"
+        );
+        if(!insert_link) return Result<void>::failure(insert_link.error());
+        for(const auto& id : referenced) {
+            auto* statement = insert_link.value().get();
+            sqlite3_reset(statement);
+            sqlite3_clear_bindings(statement);
+            if(!bind_id(statement, 1, annotation_id) || !bind_id(statement, 2, id)
+               || sqlite3_step(statement) != SQLITE_DONE) {
+                return Result<void>::failure(Error(ErrorCode::storage_failure, "Note asset reference could not be stored"));
+            }
+        }
+        auto orphaned = prepare(
+            database_.get(),
+            "SELECT object_key FROM assets a WHERE NOT EXISTS ("
+            "SELECT 1 FROM annotation_assets aa WHERE aa.asset_id = a.id)"
+        );
+        if(!orphaned) return Result<void>::failure(orphaned.error());
+        int step = SQLITE_ROW;
+        while((step = sqlite3_step(orphaned.value().get())) == SQLITE_ROW) {
+            const auto* key = reinterpret_cast<const char*>(sqlite3_column_text(orphaned.value().get(), 0));
+            if(key == nullptr) return Result<void>::failure(Error(ErrorCode::storage_failure, "Orphaned asset path is invalid"));
+            reclaimed.push_back(root_ / std::filesystem::path(key));
+        }
+        if(step != SQLITE_DONE || !execute(
+            database_.get(),
+            "DELETE FROM assets WHERE NOT EXISTS (SELECT 1 FROM annotation_assets aa WHERE aa.asset_id = assets.id)"
+        )) {
+            return Result<void>::failure(Error(ErrorCode::storage_failure, "Orphaned assets could not be reclaimed"));
+        }
+        return Result<void>::success();
+    }
+
     [[nodiscard]] Result<std::optional<DocumentRecord>> find_by_hash(std::string_view hash) {
         auto statement_result = prepare(
             database_.get(),
@@ -1776,6 +2649,7 @@ Result<std::unique_ptr<SqliteWorkspace>> SqliteWorkspace::create(
     for(const auto& directory : {
             absolute_root,
             absolute_root / "objects" / "pdf",
+            absolute_root / "objects" / "assets",
             absolute_root / "cache" / "render",
             absolute_root / "cache" / "thumbnail",
             absolute_root / "backups",
@@ -1815,6 +2689,10 @@ Result<std::unique_ptr<SqliteWorkspace>> SqliteWorkspace::create(
     auto info_result = read_workspace_info(database.get());
     if(!info_result) {
         return Result<std::unique_ptr<SqliteWorkspace>>::failure(info_result.error());
+    }
+    auto index_result = attach_search_index(database.get(), absolute_root / "index.db");
+    if(!index_result) {
+        return Result<std::unique_ptr<SqliteWorkspace>>::failure(index_result.error());
     }
 
     return Result<std::unique_ptr<SqliteWorkspace>>::success(
@@ -1865,39 +2743,17 @@ Result<std::unique_ptr<SqliteWorkspace>> SqliteWorkspace::open(
     if(!version_result) {
         return Result<std::unique_ptr<SqliteWorkspace>>::failure(version_result.error());
     }
-    if(version_result.value() < current_schema_version) {
-        auto backup_result = create_migration_backup(
-            database.get(),
-            absolute_root,
-            version_result.value()
-        );
-        if(!backup_result) {
-            return Result<std::unique_ptr<SqliteWorkspace>>::failure(backup_result.error());
-        }
-        auto fault = fail_at_fault_point(
-            "CONTEXT_READER_TEST_MIGRATION_FAULT",
-            "after-backup",
-            "Injected workspace migration failure after backup"
-        );
-        if(!fault) {
-            return Result<std::unique_ptr<SqliteWorkspace>>::failure(fault.error());
-        }
-    }
     auto migration = migrate_database(database.get());
     if(!migration) {
         return Result<std::unique_ptr<SqliteWorkspace>>::failure(migration.error());
     }
-    auto migration_fault = fail_at_fault_point(
-        "CONTEXT_READER_TEST_MIGRATION_FAULT",
-        "after-migration",
-        "Injected workspace migration failure after commit"
-    );
-    if(!migration_fault) {
-        return Result<std::unique_ptr<SqliteWorkspace>>::failure(migration_fault.error());
-    }
     auto info_result = read_workspace_info(database.get());
     if(!info_result) {
         return Result<std::unique_ptr<SqliteWorkspace>>::failure(info_result.error());
+    }
+    auto index_result = attach_search_index(database.get(), absolute_root / "index.db");
+    if(!index_result) {
+        return Result<std::unique_ptr<SqliteWorkspace>>::failure(index_result.error());
     }
 
     return Result<std::unique_ptr<SqliteWorkspace>>::success(
@@ -1972,7 +2828,7 @@ Result<WorkspaceInspection> SqliteWorkspace::inspect(const std::filesystem::path
         );
     }
     const auto version = static_cast<std::uint32_t>(version_result.value());
-    if(version == 0U || version > current_schema_version) {
+    if(version != current_schema_version) {
         return Result<WorkspaceInspection>::failure(
             Error(ErrorCode::unsupported_document, "Workspace schema version is unsupported")
         );
@@ -1981,8 +2837,86 @@ Result<WorkspaceInspection> SqliteWorkspace::inspect(const std::filesystem::path
         .id = workspace_id.value(),
         .schema_version = version,
         .target_schema_version = current_schema_version,
-        .migration_required = version < current_schema_version,
+        .migration_required = false,
     });
+}
+
+Result<BackupInspection> SqliteWorkspace::inspect_package(
+    const std::filesystem::path& package_path
+) {
+    std::error_code filesystem_error;
+    const auto temporary_root = std::filesystem::temp_directory_path(filesystem_error) /
+        ("context-reader-package-" + std::to_string(GetCurrentProcessId()) + "-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    if(filesystem_error) {
+        return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Temporary directory is unavailable"));
+    }
+    auto result = validate_and_extract_package(package_path, temporary_root);
+    std::filesystem::remove_all(temporary_root, filesystem_error);
+    return result;
+}
+
+Result<WorkspaceInfo> SqliteWorkspace::restore_package(
+    const std::filesystem::path& package_path,
+    const std::filesystem::path& empty_target
+) {
+    if(empty_target.empty()) {
+        return Result<WorkspaceInfo>::failure(Error(ErrorCode::invalid_argument, "Restore target is empty"));
+    }
+    std::error_code filesystem_error;
+    const auto absolute_target = std::filesystem::absolute(empty_target, filesystem_error);
+    if(filesystem_error) {
+        return Result<WorkspaceInfo>::failure(Error(ErrorCode::storage_failure, "Restore target could not be resolved"));
+    }
+    if(std::filesystem::exists(absolute_target, filesystem_error)
+       && (!std::filesystem::is_directory(absolute_target, filesystem_error)
+           || !std::filesystem::is_empty(absolute_target, filesystem_error))) {
+        return Result<WorkspaceInfo>::failure(Error(ErrorCode::conflict, "Restore target must be an empty directory"));
+    }
+    std::filesystem::create_directories(absolute_target.parent_path(), filesystem_error);
+    if(filesystem_error) {
+        return Result<WorkspaceInfo>::failure(Error(ErrorCode::storage_failure, "Restore parent directory could not be created"));
+    }
+    auto temporary_root = absolute_target;
+    temporary_root += ".restore-" + std::to_string(GetCurrentProcessId()) + "-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    if(std::filesystem::exists(temporary_root, filesystem_error)) {
+        return Result<WorkspaceInfo>::failure(Error(ErrorCode::conflict, "Restore staging directory already exists"));
+    }
+    auto inspection = validate_and_extract_package(package_path, temporary_root);
+    if(!inspection) {
+        std::filesystem::remove_all(temporary_root, filesystem_error);
+        return Result<WorkspaceInfo>::failure(inspection.error());
+    }
+    const auto space = std::filesystem::space(absolute_target.parent_path(), filesystem_error);
+    if(filesystem_error || space.available < inspection.value().total_uncompressed_bytes) {
+        std::filesystem::remove_all(temporary_root, filesystem_error);
+        return Result<WorkspaceInfo>::failure(Error(ErrorCode::resource_exhausted, "Insufficient disk space for workspace restore"));
+    }
+    auto database = open_database(temporary_root / "workspace.db", false);
+    if(!database) {
+        std::filesystem::remove_all(temporary_root, filesystem_error);
+        return Result<WorkspaceInfo>::failure(database.error());
+    }
+    auto info = read_workspace_info(database.value().get());
+    database.value().reset();
+    if(!info) {
+        std::filesystem::remove_all(temporary_root, filesystem_error);
+        return Result<WorkspaceInfo>::failure(info.error());
+    }
+    if(std::filesystem::exists(absolute_target, filesystem_error)) {
+        std::filesystem::remove(absolute_target, filesystem_error);
+        if(filesystem_error) {
+            std::filesystem::remove_all(temporary_root, filesystem_error);
+            return Result<WorkspaceInfo>::failure(Error(ErrorCode::storage_failure, "Empty restore target could not be prepared"));
+        }
+    }
+    std::filesystem::rename(temporary_root, absolute_target, filesystem_error);
+    if(filesystem_error) {
+        std::filesystem::remove_all(temporary_root, filesystem_error);
+        return Result<WorkspaceInfo>::failure(Error(ErrorCode::storage_failure, "Restored workspace could not be committed"));
+    }
+    return info;
 }
 
 WorkspaceInfo SqliteWorkspace::info() const noexcept {
@@ -2026,6 +2960,33 @@ Result<std::vector<NoteRecord>> SqliteWorkspace::list_notes(
     DocumentVersionId document_version_id
 ) {
     return implementation_->list_notes(document_version_id);
+}
+
+Result<void> SqliteWorkspace::rebuild_search_index(const CancellationToken& cancellation) {
+    return implementation_->rebuild_search_index(cancellation);
+}
+
+Result<SearchResponse> SqliteWorkspace::search(std::string_view query, std::size_t limit) {
+    return implementation_->search(query, limit);
+}
+
+Result<AssetRecord> SqliteWorkspace::import_note_asset(
+    AnnotationId annotation_id,
+    const std::filesystem::path& source,
+    const CancellationToken& cancellation
+) {
+    return implementation_->import_note_asset(annotation_id, source, cancellation);
+}
+
+Result<AssetData> SqliteWorkspace::read_asset(AssetId asset_id) {
+    return implementation_->read_asset(asset_id);
+}
+
+Result<BackupInspection> SqliteWorkspace::export_package(
+    const std::filesystem::path& destination,
+    const CancellationToken& cancellation
+) {
+    return implementation_->export_package(destination, cancellation);
 }
 
 Result<WorkspaceVerification> SqliteWorkspace::verify() {

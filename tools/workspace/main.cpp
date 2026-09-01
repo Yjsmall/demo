@@ -67,7 +67,7 @@ void print_inspection(std::string_view command, const WorkspaceInspection& inspe
 int usage() {
     std::cerr << "Usage: reader-workspace inspect <workspace>\n"
                  "       reader-workspace verify <workspace>\n"
-                 "       reader-workspace migrate <workspace> --dry-run\n";
+                 "       reader-workspace verify-package <backup.readerpkg>\n";
     return 2;
 }
 
@@ -85,12 +85,17 @@ int wmain(int argc, wchar_t** argv) {
         print_inspection("inspect", inspection.value());
         return 0;
     }
-    if(command == L"migrate") {
-        if(argc != 4 || std::wstring_view(argv[3]) != L"--dry-run") return usage();
-        auto inspection = SqliteWorkspace::inspect(workspace);
+    if(command == L"verify-package") {
+        if(argc != 3) return usage();
+        auto inspection = SqliteWorkspace::inspect_package(workspace);
         if(!inspection) return print_error(inspection.error());
-        print_inspection("migrate-dry-run", inspection.value());
-        return 0;
+        std::cout << "{\"ok\":true,\"command\":\"verify-package\",\"valid\":"
+                  << (inspection.value().valid ? "true" : "false")
+                  << ",\"formatVersion\":" << inspection.value().format_version
+                  << ",\"fileCount\":" << inspection.value().file_count
+                  << ",\"totalUncompressedBytes\":" << inspection.value().total_uncompressed_bytes
+                  << "}\n";
+        return inspection.value().valid ? 0 : 5;
     }
     if(command == L"verify") {
         if(argc != 3) return usage();

@@ -4,3 +4,4 @@ out/
 node_modules/
 hosts/electron/node_modules/
 npm-debug.log*
+hosts/electron/renderer/bundle/
