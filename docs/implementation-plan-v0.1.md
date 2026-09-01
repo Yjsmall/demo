@@ -103,7 +103,7 @@ P0 决策与骨架
 
 ## 6. P2：Electron 首个纵向闭环
 
-本地实施状态：已完成。Workspace schema v2、Quote Anchor 高亮、revision 化纯文本 Markdown Note，以及沙箱化 Renderer -> 限定 preload/IPC -> Utility Process -> Node-API -> Facade 的阅读、选择、高亮、笔记和重启恢复路径均已通过测试。导入、打开和渲染使用带稳定 ID 与取消令牌的 Job；Utility Process 在导入事务 `COMMIT` 前后被终止后，工作区可重新打开并分别恢复为未提交与已提交状态，且只读不变量检查有效。
+本地实施状态：已完成。Workspace schema v2、Quote Anchor 高亮、revision 化纯文本 Markdown Note，以及沙箱化 Renderer -> 限定 preload/IPC -> Utility Process -> Node-API -> Facade 的阅读、DOM 选择、高亮、笔记自动保存和重启恢复路径均已通过测试。Renderer 验收使用同一 Workspace 连续启动两个真实 Electron 进程，并在首次显式关闭后由第二次启动核对持久化状态。导入、打开和渲染使用带稳定 ID 与取消令牌的 Job；Utility Process 在导入事务 `COMMIT` 前后被终止后，工作区可重新打开并分别恢复为未提交与已提交状态，且只读不变量检查有效。
 
 交付内容：
 
@@ -121,7 +121,7 @@ P0 决策与骨架
 
 ## 7. P3：数据与边界稳定
 
-本地实施状态：已完成。Electron Main 使用单实例锁；Workspace 提供独占写入、稳定 Busy 错误、孤立对象恢复和迁移前备份；导入、Note 自动保存和迁移具有提交前后故障验证。Utility Process 由带 generation 的 Main supervisor 自动重启并恢复 Workspace/Document 意图，旧 generation 的请求统一失败且不能命中新请求。Node-API 契约覆盖参数、错误、Job、取消、Buffer 和关闭顺序；Facade 与 Node 的归一化行为由同一脚本比较。`reader-replay` 采用 JSON Schema 描述的 JSONL v1，并通过虚拟 Clock、固定 Seed 和受控 Executor 在真实 Node 异步边界稳定重放取消竞态。`pixi run p3` 是统一机器验收入口。
+本地实施状态：已完成。Electron Main 使用单实例锁；Workspace 提供独占写入、稳定 Busy 错误、孤立对象恢复和迁移前备份；导入、Note 自动保存和迁移具有提交前后故障验证。Utility Process 由带 generation 的 Main supervisor 自动重启并恢复 Workspace/Document 意图；验收会在 Note 提交后、Document 关闭后和 Workspace 关闭后丢弃响应并终止 Utility，分别验证权威 revision、陈旧 revision 冲突和关闭意图不会被恢复逻辑撤销。Node-API 契约覆盖参数、错误、Job、取消、Buffer 和关闭顺序；Facade 与 Node 的归一化行为由同一脚本比较。`reader-replay` 采用 JSON Schema 描述的 JSONL v1，并通过虚拟 Clock、固定 Seed 和受控 Executor 在真实 Node 异步边界稳定重放取消竞态。`pixi run p3` 是统一机器验收入口。
 
 交付内容：
 

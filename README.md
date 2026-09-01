@@ -60,9 +60,9 @@ pixi run p3-single-instance-smoke
 
 `pixi run p1` 会从官方 tag 准备锁定提交的 MuPDF 1.28.3 最小静态构建，验证 Fixture manifest，并运行 PDF Port、坐标、真实 MuPDF Adapter 和 `reader-probe inspect` 契约测试。独立 MSYS2 还需要安装 `make` 和 UCRT64 `pkgconf`；MuPDF 源码及构建产物只保存在忽略的 `build/` 目录。
 
-`pixi run p2` 在 P1 基础上构建 SQLite Workspace 与 P2 `reader_node`，运行持久化/重启集成测试、PE 导入边界检查，并验证 Utility Process 及沙箱化 Renderer 两条真实 Electron 路径。Utility smoke 还会验证排队 Job 取消，以及导入事务提交前后终止进程后的恢复结果；Renderer smoke 会完成创建、导入、渲染、文本选择、高亮和笔记保存，并在 `build/renderer-p2-smoke.png` 留下非空像素检查通过的截图。
+`pixi run p2` 在 P1 基础上构建 SQLite Workspace 与 P2 `reader_node`，运行持久化/重启集成测试、PE 导入边界检查，并验证 Utility Process 及沙箱化 Renderer 两条真实 Electron 路径。Utility smoke 还会验证排队 Job 取消，以及导入事务提交前后终止进程后的恢复结果；Renderer smoke 使用同一 Workspace 连续启动两个真实 Electron 进程，完成创建、导入、DOM 文本选择、高亮、笔记自动保存、显式关闭和重启恢复，并在 `build/renderer-p2-smoke.png` 留下恢复状态的非空像素截图。
 
-`pixi run p3` 包含完整 P2 回归，并验证单实例、Workspace 故障恢复矩阵、Utility Process 重启恢复和陈旧请求隔离、Node-API 参数/错误/Job/取消/Buffer/关闭契约、Facade/Node 行为一致性，以及同一 JSONL Replay 连续两次产生完全相同的取消结果。
+`pixi run p3` 包含完整 P2 回归，并验证单实例、Workspace 故障恢复矩阵、Utility Process 重启恢复、Note 提交后响应丢失时的 revision 冲突、Document/Workspace 关闭后响应丢失时的关闭意图、Node-API 参数/错误/Job/取消/Buffer/关闭契约、Facade/Node 行为一致性，以及同一 JSONL Replay 连续两次产生完全相同的取消结果。
 
 `npm run start:p2` 启动当前 P2 桌面宿主。Renderer 只能使用 preload 暴露的限定 API；工作区和 PDF 路径必须先由 Main 文件对话框授权，原生模块、SQLite、MuPDF 和任意文件系统访问均不暴露给 Renderer。
 

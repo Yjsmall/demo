@@ -26,7 +26,12 @@ const state = {
   imageUrl: null,
   busy: false,
   activeJob: null,
+  noteDirty: false,
+  noteAutosaveTimer: null,
+  noteSavingPromise: null,
 };
+
+const noteAutosaveDelayMs = 350;
 
 function setStatus(message, isError = false) {
   elements.status.textContent = message;
@@ -174,7 +179,7 @@ function renderLayers() {
       button.dataset.color = annotation.color;
       button.title = annotation.quote.exact;
       button.classList.toggle('selected', annotation.id === state.selectedAnnotationId);
-      button.addEventListener('click', () => selectAnnotation(annotation.id));
+      button.addEventListener('click', () => { void selectAnnotation(annotation.id); });
       place(button, quad);
       elements['annotation-layer'].append(button);
     });
@@ -185,15 +190,43 @@ function renderNote() {
   const annotation = selectedAnnotation();
   const note = selectedNote();
   elements['selected-quote'].textContent = annotation?.quote.exact || '选择一个高亮';
-  elements['note-source'].value = note?.markdownSource || '';
+  if (!state.noteDirty && !state.noteSavingPromise) {
+    elements['note-source'].value = note?.markdownSource || '';
+  }
   elements['note-revision'].textContent = `revision ${note?.revision ?? 0}`;
   updateControls();
 }
 
-function selectAnnotation(annotationId) {
+async function selectAnnotation(annotationId) {
+  if (annotationId !== state.selectedAnnotationId) await flushPendingNote();
   state.selectedAnnotationId = annotationId;
   renderLayers();
   renderNote();
+}
+
+function clearNoteAutosaveTimer() {
+  if (state.noteAutosaveTimer !== null) {
+    clearTimeout(state.noteAutosaveTimer);
+    state.noteAutosaveTimer = null;
+  }
+}
+
+function scheduleNoteAutosave() {
+  if (!selectedAnnotation()) return;
+  state.noteDirty = true;
+  clearNoteAutosaveTimer();
+  setStatus('笔记尚未保存');
+  state.noteAutosaveTimer = setTimeout(() => {
+    state.noteAutosaveTimer = null;
+    void saveNote(true).catch(() => {});
+  }, noteAutosaveDelayMs);
+}
+
+async function flushPendingNote() {
+  clearNoteAutosaveTimer();
+  if (state.noteSavingPromise) await state.noteSavingPromise;
+  if (state.noteDirty) return saveNote(true);
+  return selectedNote();
 }
 
 function selectionChanged() {
@@ -220,6 +253,7 @@ async function refreshDocuments() {
 }
 
 async function openWorkspaceAt(workspacePath, create) {
+  await flushPendingNote();
   await perform(create ? '正在创建工作区' : '正在打开工作区', async () => {
     if (state.workspace) {
       if (state.document) await api.closeDocument();
@@ -231,6 +265,7 @@ async function openWorkspaceAt(workspacePath, create) {
     state.document = null;
     state.annotations = [];
     state.notes = [];
+    state.noteDirty = false;
     await refreshDocuments();
   });
   updateControls();
@@ -258,12 +293,14 @@ async function choosePdf() {
 }
 
 async function openDocument(documentRecord) {
+  await flushPendingNote();
   await perform('正在打开文档', async () => {
     if (state.document) await api.closeDocument();
     state.document = null;
     state.document = await awaitJob(api.openDocument(documentRecord.documentId));
     state.pageIndex = 0;
     state.selectedAnnotationId = null;
+    state.noteDirty = false;
     state.annotations = await api.listAnnotations(state.document.versionId);
     state.notes = await api.listNotes(state.document.versionId);
     await renderPage();
@@ -297,6 +334,7 @@ async function renderPage() {
 async function changePage(delta) {
   const target = state.pageIndex + delta;
   if (target < 0 || target >= state.document.pageCount) return;
+  await flushPendingNote();
   await perform('正在加载页面', async () => {
     state.pageIndex = target;
     state.selectedAnnotationId = null;
@@ -317,6 +355,7 @@ async function changeZoom(delta) {
 
 async function createHighlight() {
   if (state.selectedLines.length === 0) return null;
+  await flushPendingNote();
   const lines = state.selectedLines.map((index) => state.pageText.lines[index]);
   const annotation = await perform('正在保存高亮', () => api.createAnnotation({
     documentVersionId: state.document.versionId,
@@ -341,25 +380,46 @@ async function createHighlight() {
   return annotation;
 }
 
-async function saveNote() {
+async function saveNote(automatic = false) {
   const annotation = selectedAnnotation();
   if (!annotation) return null;
+  clearNoteAutosaveTimer();
+  if (state.noteSavingPromise) return state.noteSavingPromise;
+  if (automatic && !state.noteDirty) return selectedNote();
+  if (state.busy) {
+    if (automatic) scheduleNoteAutosave();
+    return null;
+  }
   const existing = selectedNote();
-  const note = await perform('正在保存笔记', () => api.updateNote({
+  const markdownSource = elements['note-source'].value;
+  state.noteDirty = false;
+  const saving = perform(automatic ? '正在自动保存笔记' : '正在保存笔记', () => api.updateNote({
     annotationId: annotation.id,
     expectedRevision: existing?.revision ?? 0,
-    markdownSource: elements['note-source'].value,
-  }));
-  if (!note) return null;
-  state.notes = state.notes.filter((item) => item.annotationId !== annotation.id);
-  state.notes.push(note);
-  renderNote();
-  return note;
+    markdownSource,
+  })).then((note) => {
+    if (!note) return null;
+    state.notes = state.notes.filter((item) => item.annotationId !== annotation.id);
+    state.notes.push(note);
+    renderNote();
+    return note;
+  }).catch((error) => {
+    state.noteDirty = true;
+    throw error;
+  });
+  state.noteSavingPromise = saving;
+  try {
+    return await saving;
+  } finally {
+    if (state.noteSavingPromise === saving) state.noteSavingPromise = null;
+  }
 }
 
 async function deleteAnnotation() {
   const annotation = selectedAnnotation();
   if (!annotation) return;
+  clearNoteAutosaveTimer();
+  state.noteDirty = false;
   await perform('正在删除高亮', () => api.deleteAnnotation(annotation.id));
   state.annotations = state.annotations.filter((item) => item.id !== annotation.id);
   state.notes = state.notes.filter((item) => item.annotationId !== annotation.id);
@@ -397,8 +457,9 @@ elements['next-page'].addEventListener('click', () => changePage(1));
 elements['zoom-out'].addEventListener('click', () => changeZoom(-0.25));
 elements['zoom-in'].addEventListener('click', () => changeZoom(0.25));
 elements['highlight-selection'].addEventListener('click', createHighlight);
-elements['save-note'].addEventListener('click', saveNote);
+elements['save-note'].addEventListener('click', () => saveNote(false));
 elements['delete-annotation'].addEventListener('click', deleteAnnotation);
+elements['note-source'].addEventListener('input', scheduleNoteAutosave);
 elements['cancel-job'].addEventListener('click', () => {
   if (!state.activeJob) return;
   state.activeJob.cancel();
@@ -420,22 +481,70 @@ async function runSmoke() {
   const config = await api.smokeConfig();
   if (!config) return;
   try {
-    await openWorkspaceAt(config.workspacePath, true);
-    await importPdfAt(config.fixturePath);
-    state.selectedLines = [0];
-    state.selectionText = state.pageText.lines[0].text;
-    const annotation = await createHighlight();
-    elements['note-source'].value = 'Renderer **context** note';
-    const note = await saveNote();
-    api.reportSmokeResult({
-      status: 'ok',
-      documentCount: state.documents.length,
-      annotationCount: annotation ? 1 : 0,
-      noteRevision: note?.revision,
-      uiContract: inspectUiContract(),
-    });
+    if (config.phase === 'setup') {
+      await openWorkspaceAt(config.workspacePath, true);
+      await importPdfAt(config.fixturePath);
+      const firstLine = elements['text-layer'].querySelector('.text-line');
+      const range = document.createRange();
+      range.selectNodeContents(firstLine);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      firstLine.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      const selectedLineCount = state.selectedLines.length;
+      const annotation = await createHighlight();
+      elements['note-source'].value = 'Renderer **autosaved** note';
+      elements['note-source'].dispatchEvent(new Event('input', { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, noteAutosaveDelayMs + 100));
+      if (state.noteSavingPromise) await state.noteSavingPromise;
+      const note = selectedNote();
+      await api.reportSmokeResult({
+        status: 'ok',
+        phase: config.phase,
+        stage: 'content',
+        documentCount: state.documents.length,
+        annotationCount: annotation ? 1 : 0,
+        selectedLineCount,
+        noteRevision: note?.revision,
+        noteMarkdown: note?.markdownSource,
+        uiContract: inspectUiContract(),
+      });
+      await api.closeDocument();
+      state.document = null;
+      await api.closeWorkspace();
+      state.workspace = null;
+      await api.reportSmokeResult({
+        status: 'ok', phase: config.phase, stage: 'closed', closed: true,
+      });
+      return;
+    }
+
+    if (config.phase === 'recovery') {
+      await openWorkspaceAt(config.workspacePath, false);
+      await openDocument(state.documents[0]);
+      const verification = await api.verifyWorkspace();
+      const note = state.notes[0];
+      if (state.annotations[0]) await selectAnnotation(state.annotations[0].id);
+      await api.reportSmokeResult({
+        status: 'ok',
+        phase: config.phase,
+        stage: 'recovered',
+        documentCount: state.documents.length,
+        annotationCount: state.annotations.length,
+        noteCount: state.notes.length,
+        noteRevision: note?.revision,
+        noteMarkdown: note?.markdownSource,
+        workspaceValid: verification.valid,
+      });
+      return;
+    }
+    throw new Error(`Unknown renderer smoke phase: ${config.phase}`);
   } catch (error) {
-    api.reportSmokeResult({ status: 'error', message: errorMessage(error) });
+    try {
+      await api.reportSmokeResult({
+        status: 'error', phase: config.phase, message: errorMessage(error),
+      });
+    } catch {}
   }
 }
 

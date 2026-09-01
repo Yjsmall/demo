@@ -46,5 +46,5 @@ contextBridge.exposeInMainWorld('contextReader', Object.freeze({
   listNotes: (documentVersionId) => invoke('listNotes', documentVersionId),
   verifyWorkspace: () => invoke('verifyWorkspace'),
   smokeConfig: () => ipcRenderer.invoke('reader:smoke-config'),
-  reportSmokeResult: (result) => ipcRenderer.send('reader:smoke-result', result),
+  reportSmokeResult: (result) => ipcRenderer.invoke('reader:smoke-result', result),
 }));

@@ -82,8 +82,12 @@ interface ContextReaderApi {
   }): Promise<NoteRecord>;
   listNotes(documentVersionId: string): Promise<NoteRecord[]>;
   verifyWorkspace(): Promise<{ valid: boolean; issues: string[] }>;
-  smokeConfig(): Promise<{ workspacePath: string; fixturePath: string } | null>;
-  reportSmokeResult(result: unknown): void;
+  smokeConfig(): Promise<{
+    workspacePath: string;
+    fixturePath: string;
+    phase: 'setup' | 'recovery';
+  } | null>;
+  reportSmokeResult(result: unknown): Promise<unknown>;
 }
 
 declare global {

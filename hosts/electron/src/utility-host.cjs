@@ -27,6 +27,7 @@ function send(message) {
 try {
   const addonPath = path.resolve(process.argv[2]);
   const readerNode = require(addonPath);
+  let responseFaultOperation = null;
 
   process.parentPort.on('message', async (event) => {
     const message = event?.data ?? event;
@@ -35,6 +36,22 @@ try {
       return;
     }
     if (message?.kind !== 'request' || !operations.has(message.operation)) {
+      if (message?.kind === 'request' && message.operation === '__testArmResponseFault'
+          && process.env.CONTEXT_READER_UTILITY_RESTART_FIXTURE) {
+        const operation = message.arguments?.[0];
+        if (!operations.has(operation)) {
+          send({
+            kind: 'response',
+            requestId: message.requestId,
+            ok: false,
+            error: { code: 'INVALID_ARGUMENT', message: 'Fault operation is invalid' },
+          });
+          return;
+        }
+        responseFaultOperation = operation;
+        send({ kind: 'response', requestId: message.requestId, ok: true, value: operation });
+        return;
+      }
       if (message?.kind === 'request' && message.operation === '__testDelay'
           && process.env.CONTEXT_READER_UTILITY_RESTART_FIXTURE) {
         const delay = Number(message.arguments?.[0] ?? 0);
@@ -49,6 +66,11 @@ try {
       const args = [...(message.arguments ?? [])];
       if (message.jobId && jobOperations.has(message.operation)) args.push(message.jobId);
       const value = await readerNode[message.operation](...args);
+      if (responseFaultOperation === message.operation) {
+        responseFaultOperation = null;
+        process.exit(86);
+        return;
+      }
       send({ kind: 'response', requestId: message.requestId, ok: true, value });
     } catch (error) {
       send({

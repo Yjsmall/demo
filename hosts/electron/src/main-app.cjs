@@ -26,6 +26,8 @@ let nextRequestId = 1;
 const pending = new Map();
 const grantedPaths = new Set();
 const smokeFixture = process.env.CONTEXT_READER_SMOKE_FIXTURE || null;
+const smokeWorkspacePath = process.env.CONTEXT_READER_SMOKE_WORKSPACE || null;
+const smokePhase = process.env.CONTEXT_READER_SMOKE_PHASE || 'single';
 const singleInstanceSmoke = process.env.CONTEXT_READER_SINGLE_INSTANCE_SMOKE === '1';
 const utilityRestartFixture = process.env.CONTEXT_READER_UTILITY_RESTART_FIXTURE || null;
 let smokeRoot = null;
@@ -139,6 +141,12 @@ function startUtility() {
 }
 
 async function requestUtility(operation, args, jobId = null) {
+  if (operation === 'closeWorkspace') {
+    desiredWorkspacePath = null;
+    desiredDocumentId = null;
+  } else if (operation === 'closeDocument') {
+    desiredDocumentId = null;
+  }
   await ready;
   const target = child;
   const generation = utilityGeneration;
@@ -150,15 +158,35 @@ async function requestUtility(operation, args, jobId = null) {
   const value = await sendUtility(target, generation, operation, args, jobId);
   if (operation === 'createWorkspace' || operation === 'openWorkspace') {
     desiredWorkspacePath = path.resolve(args[0]);
-  } else if (operation === 'closeWorkspace') {
-    desiredWorkspacePath = null;
-    desiredDocumentId = null;
   } else if (operation === 'openDocument') {
     desiredDocumentId = args[0];
-  } else if (operation === 'closeDocument') {
-    desiredDocumentId = null;
   }
   return value;
+}
+
+async function armResponseFault(operation) {
+  await ready;
+  const target = child;
+  const generation = utilityGeneration;
+  if (!target) throw new Error('Reader utility is unavailable');
+  await sendUtility(target, generation, '__testArmResponseFault', [operation]);
+}
+
+async function waitForUtilityRestart(previousGeneration) {
+  while (utilityGeneration === previousGeneration) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return ready;
+}
+
+async function expectUtilityExit(operation) {
+  try {
+    await operation;
+  } catch (error) {
+    if (error?.code === 'UTILITY_EXITED') return;
+    throw error;
+  }
+  throw new Error('Faulted Utility operation unexpectedly returned a result');
 }
 
 async function runUtilityRestartSmoke() {
@@ -182,10 +210,7 @@ async function runUtilityRestartSmoke() {
     } catch (error) {
       interruptedCode = error?.code;
     }
-    while (utilityGeneration === previousGeneration) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    const runtime = await ready;
+    const runtime = await waitForUtilityRestart(previousGeneration);
     const documents = await requestUtility('listDocuments', []);
     const page = await requestUtility('pageInfo', [0]);
     const rendered = await requestUtility('renderPage', [0, 1], 'restart-fresh-render');
@@ -194,9 +219,89 @@ async function runUtilityRestartSmoke() {
         || rendered.png.length <= 8) {
       throw new Error('Utility restart did not restore state or isolate the stale request');
     }
+
+    const pageText = await requestUtility('extractPageText', [0]);
+    const annotation = await requestUtility('createAnnotation', [{
+      documentVersionId: imported.document.versionId,
+      pageIndex: 0,
+      quads: [pageText.lines[0].bounds],
+      quote: { exact: pageText.lines[0].text, prefix: '', suffix: '' },
+      layoutVersion: 'mupdf-1.28.3',
+      color: 'yellow',
+    }]);
+    const initialNote = await requestUtility('updateNote', [{
+      annotationId: annotation.id,
+      expectedRevision: 0,
+      markdownSource: 'restart revision one',
+    }]);
+
+    let faultGeneration = utilityGeneration;
+    await armResponseFault('updateNote');
+    await expectUtilityExit(requestUtility('updateNote', [{
+      annotationId: annotation.id,
+      expectedRevision: initialNote.revision,
+      markdownSource: 'committed before response loss',
+    }]));
+    await waitForUtilityRestart(faultGeneration);
+    const recoveredNotes = await requestUtility('listNotes', [imported.document.versionId]);
+    let staleRevisionCode = null;
+    try {
+      await requestUtility('updateNote', [{
+        annotationId: annotation.id,
+        expectedRevision: initialNote.revision,
+        markdownSource: 'stale generation overwrite',
+      }]);
+    } catch (error) {
+      staleRevisionCode = error?.code;
+    }
+    const recoveredNote = recoveredNotes.find((note) => note.annotationId === annotation.id);
+    const freshNote = await requestUtility('updateNote', [{
+      annotationId: annotation.id,
+      expectedRevision: recoveredNote?.revision,
+      markdownSource: 'fresh generation revision',
+    }]);
+    if (recoveredNote?.revision !== 2
+        || recoveredNote.markdownSource !== 'committed before response loss'
+        || staleRevisionCode !== 'CONFLICT' || freshNote.revision !== 3) {
+      throw new Error('Utility restart did not preserve authoritative note revision semantics');
+    }
+
+    faultGeneration = utilityGeneration;
+    await armResponseFault('closeDocument');
+    await expectUtilityExit(requestUtility('closeDocument', []));
+    await waitForUtilityRestart(faultGeneration);
+    let closedDocumentCode = null;
+    try {
+      await requestUtility('pageInfo', [0]);
+    } catch (error) {
+      closedDocumentCode = error?.code;
+    }
+    if (closedDocumentCode !== 'NOT_FOUND') {
+      throw new Error('Document close intent was not preserved after response loss');
+    }
+
+    await requestUtility('openDocument', [imported.document.documentId], 'restart-reopen');
+    faultGeneration = utilityGeneration;
+    await armResponseFault('closeWorkspace');
+    await expectUtilityExit(requestUtility('closeWorkspace', []));
+    await waitForUtilityRestart(faultGeneration);
+    let closedWorkspaceCode = null;
+    try {
+      await requestUtility('listDocuments', []);
+    } catch (error) {
+      closedWorkspaceCode = error?.code;
+    }
+    if (closedWorkspaceCode !== 'NOT_FOUND') {
+      throw new Error('Workspace close intent was not preserved after response loss');
+    }
+    await requestUtility('openWorkspace', [workspacePath]);
+    const recoveredDocuments = await requestUtility('listDocuments', []);
+    if (recoveredDocuments.length !== 1) {
+      throw new Error('Workspace did not reopen after close response loss');
+    }
     process.stdout.write(
       `Electron Utility restart smoke passed: generation ${previousGeneration}`
-        + ` -> ${runtime.utilityGeneration}\n`,
+        + ` -> ${utilityGeneration}, note revision ${freshNote.revision}\n`,
     );
   } finally {
     if (desiredDocumentId) {
@@ -301,42 +406,69 @@ function registerIpc() {
     if (event.sender !== window?.webContents || !smokeFixture) {
       return null;
     }
-    smokeRoot ??= await fs.mkdtemp(path.join(os.tmpdir(), 'context-reader-renderer-'));
-    const workspacePath = path.join(smokeRoot, 'workspace');
+    smokeRoot ??= smokeWorkspacePath
+      ? path.dirname(path.resolve(smokeWorkspacePath))
+      : await fs.mkdtemp(path.join(os.tmpdir(), 'context-reader-renderer-'));
+    const workspacePath = smokeWorkspacePath
+      ? path.resolve(smokeWorkspacePath)
+      : path.join(smokeRoot, 'workspace');
     const fixturePath = path.resolve(smokeFixture);
     grantedPaths.add(path.resolve(workspacePath));
     grantedPaths.add(fixturePath);
-    return { workspacePath, fixturePath };
+    return { workspacePath, fixturePath, phase: smokePhase };
   });
 
-  ipcMain.on('reader:smoke-result', async (event, result) => {
+  ipcMain.handle('reader:smoke-result', async (event, result) => {
     if (event.sender !== window?.webContents || !smokeFixture) {
-      return;
+      return null;
     }
     try {
-      if (result?.status !== 'ok' || result?.documentCount !== 1 || result?.annotationCount !== 1
-          || result?.noteRevision !== 1 || result?.uiContract?.palette !== true
-          || result?.uiContract?.island !== true || result?.uiContract?.layout !== true) {
+      if (result?.status !== 'ok' || result.phase !== smokePhase) {
         throw new Error(`Unexpected renderer result: ${JSON.stringify(result)}`);
       }
+      if (smokePhase === 'setup' && result.stage === 'content') {
+        if (result.documentCount !== 1 || result.annotationCount !== 1
+            || result.noteRevision !== 1 || result.noteMarkdown !== 'Renderer **autosaved** note'
+            || result.selectedLineCount !== 1 || result.uiContract?.palette !== true
+            || result.uiContract?.island !== true || result.uiContract?.layout !== true) {
+          throw new Error(`Unexpected renderer setup content: ${JSON.stringify(result)}`);
+        }
+      } else if (smokePhase === 'setup' && result.stage === 'closed') {
+        if (result.closed !== true || desiredWorkspacePath !== null || desiredDocumentId !== null) {
+          throw new Error(`Renderer setup did not close cleanly: ${JSON.stringify(result)}`);
+        }
+        setImmediate(() => app.exit(0));
+        return { ok: true };
+      } else if (smokePhase === 'recovery' && result.stage === 'recovered') {
+        if (result.documentCount !== 1 || result.annotationCount !== 1 || result.noteCount !== 1
+            || result.noteRevision !== 1 || result.noteMarkdown !== 'Renderer **autosaved** note'
+            || result.workspaceValid !== true) {
+          throw new Error(`Unexpected renderer recovery content: ${JSON.stringify(result)}`);
+        }
+      } else {
+        throw new Error(`Unexpected renderer smoke stage: ${JSON.stringify(result)}`);
+      }
+
       await new Promise((resolve) => setTimeout(resolve, 150));
       const image = await window.webContents.capturePage();
       const bitmap = image.toBitmap();
       const sampledBytes = new Set();
       const stride = Math.max(4, Math.floor(bitmap.length / 4096));
-      for (let index = 0; index < bitmap.length; index += stride) {
-        sampledBytes.add(bitmap[index]);
-      }
+      for (let index = 0; index < bitmap.length; index += stride) sampledBytes.add(bitmap[index]);
       if (image.isEmpty() || bitmap.length === 0 || sampledBytes.size < 8) {
         throw new Error('Renderer screenshot is blank');
       }
       const outputPath = path.join(projectRoot, 'build', 'renderer-p2-smoke.png');
       await fs.writeFile(outputPath, image.toPNG());
-      process.stdout.write(`Electron renderer P2 smoke passed: ${outputPath}\n`);
-      app.exit(0);
+      if (smokePhase === 'recovery') {
+        process.stdout.write(`Electron renderer P2 recovery smoke passed: ${outputPath}\n`);
+        setImmediate(() => app.exit(0));
+      }
+      return { ok: true };
     } catch (error) {
       process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-      app.exit(1);
+      setImmediate(() => app.exit(1));
+      throw error;
     }
   });
 }

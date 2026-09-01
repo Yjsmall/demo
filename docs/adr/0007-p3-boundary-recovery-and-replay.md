@@ -9,7 +9,7 @@ P2 已建立 Renderer -> Main -> Utility Process -> Node-API -> Application Faca
 
 ## 决策
 
-Electron Main 是 Utility Process 的 supervisor。每次启动分配单调递增的 generation；请求与响应绑定 generation，进程退出时该 generation 的所有未完成请求以 `UTILITY_EXITED` 失败。Main 只保存恢复所需的 Workspace 路径和稳定 DocumentId，新 Utility ready 后先重新打开这些状态，再接受后续请求。旧 generation 的消息不会解析新 generation 的 Promise。
+Electron Main 是 Utility Process 的 supervisor。每次启动分配单调递增的 generation；请求与响应绑定 generation，进程退出时该 generation 的所有未完成请求以 `UTILITY_EXITED` 失败。Main 只保存恢复所需的 Workspace 路径和稳定 DocumentId，新 Utility ready 后先重新打开这些状态，再接受后续请求。关闭意图在请求发出前更新，因此即使关闭成功后的响应丢失，新 Utility 也不会重新打开已关闭的 Document 或 Workspace。旧 generation 的消息不会解析新 generation 的 Promise。
 
 Node-API 使用真实 Electron Utility 执行契约测试。参数错误在 Binding 边界返回稳定 `INVALID_ARGUMENT`；业务错误沿用 Kernel 错误码；渲染结果使用独立 Buffer 拷贝。另由 Facade 契约探针和 Node 契约输出归一化 JSON，并逐字段比较相同行为场景。
 
