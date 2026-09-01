@@ -55,7 +55,10 @@ endif()
 
 if(CONTEXT_READER_ENABLE_WORKSPACE AND CONTEXT_READER_ENABLE_MUPDF)
     add_executable(sqlite_workspace_test integration/sqlite_workspace_test.cpp)
-    target_link_libraries(sqlite_workspace_test PRIVATE context_reader::core SQLite::SQLite3)
+    target_link_libraries(
+        sqlite_workspace_test
+        PRIVATE context_reader::core SQLite::SQLite3 Miniz::Miniz
+    )
     target_compile_features(sqlite_workspace_test PRIVATE cxx_std_20)
     target_compile_definitions(
         sqlite_workspace_test

@@ -77,6 +77,23 @@ async function run() {
     }
 
     const activeRender = readerNode.renderPage(0, 16, 'contract-duplicate-job');
+    let admissionCode = null;
+    try {
+      readerNode.renderTile({
+        pageIndex: 0,
+        pixelsPerPoint: 1,
+        xPixels: 0,
+        yPixels: 0,
+        widthPixels: 128,
+        heightPixels: 128,
+        generation: 8,
+      }, 'contract-admission');
+    } catch (error) {
+      admissionCode = error?.code;
+    }
+    if (admissionCode !== 'RESOURCE_EXHAUSTED') {
+      throw new Error(`Expected RESOURCE_EXHAUSTED admission result, received ${admissionCode}`);
+    }
     const duplicateJobCode = await expectCode(
       () => readerNode.renderPage(0, 1, 'contract-duplicate-job'),
       'CONFLICT',
@@ -130,6 +147,7 @@ async function run() {
       workspaceConflict,
       documentCount: documents.length,
       duplicateJobCode,
+      admissionCode,
       cancellationAccepted,
       cancellationCode,
       unknownCancellation,

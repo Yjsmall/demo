@@ -56,6 +56,12 @@ try {
         }
         if (request?.kind !== 'tile-request' || typeof request.jobId !== 'string') return;
         try {
+          if (process.env.CONTEXT_READER_UTILITY_RESTART_FIXTURE) {
+            const testDelay = Number(request.request?.testDelayMs ?? 0);
+            if (Number.isFinite(testDelay) && testDelay > 0) {
+              await new Promise((resolve) => setTimeout(resolve, Math.min(testDelay, 30_000)));
+            }
+          }
           const value = await readerNode.renderTile(request.request, request.jobId);
           dataPort.postMessage({ kind: 'tile-response', jobId: request.jobId, ok: true, value });
         } catch (error) {

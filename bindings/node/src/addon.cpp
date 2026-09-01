@@ -52,26 +52,32 @@ enum class Operation {
     verify_workspace,
 };
 
+constexpr std::size_t maximum_boundary_items = 256;
+constexpr std::size_t maximum_boundary_queue_bytes = 32U * 1024U * 1024U;
+constexpr std::size_t maximum_boundary_buffer_bytes = 64U * 1024U * 1024U;
+constexpr std::size_t base_operation_bytes = 4U * 1024U;
+
 struct RuntimeState final {
     explicit RuntimeState(std::unique_ptr<ReaderRuntime> value) : runtime(std::move(value)) {}
 
     struct Job final {
         CancellationSource cancellation;
-        napi_env environment = nullptr;
-        napi_async_work work = nullptr;
     };
 
     [[nodiscard]] bool register_job(
         const std::string& id,
-        const CancellationSource& cancellation,
-        napi_env environment,
-        napi_async_work work
+        const CancellationSource& cancellation
     ) {
         const std::scoped_lock lock(jobs_mutex);
         return jobs.emplace(
             id,
-            Job{.cancellation = cancellation, .environment = environment, .work = work}
+            Job{.cancellation = cancellation}
         ).second;
+    }
+
+    [[nodiscard]] bool has_job(const std::string& id) const {
+        const std::scoped_lock lock(jobs_mutex);
+        return jobs.contains(id);
     }
 
     [[nodiscard]] bool cancel_job(const std::string& id) {
@@ -79,12 +85,6 @@ struct RuntimeState final {
         const auto found = jobs.find(id);
         if(found == jobs.end()) return false;
         found->second.cancellation.request_cancellation();
-        if(found->second.work != nullptr) {
-            static_cast<void>(napi_cancel_async_work(
-                found->second.environment,
-                found->second.work
-            ));
-        }
         return true;
     }
 
@@ -93,9 +93,35 @@ struct RuntimeState final {
         jobs.erase(id);
     }
 
+    [[nodiscard]] bool try_admit(std::size_t queue_bytes, std::size_t buffer_bytes) {
+        const std::scoped_lock lock(admission_mutex);
+        if(admitted_items >= maximum_boundary_items
+           || queue_bytes > maximum_boundary_queue_bytes -
+                  std::min(admitted_queue_bytes, maximum_boundary_queue_bytes)
+           || buffer_bytes > maximum_boundary_buffer_bytes -
+                  std::min(admitted_buffer_bytes, maximum_boundary_buffer_bytes)) {
+            return false;
+        }
+        ++admitted_items;
+        admitted_queue_bytes += queue_bytes;
+        admitted_buffer_bytes += buffer_bytes;
+        return true;
+    }
+
+    void release_admission(std::size_t queue_bytes, std::size_t buffer_bytes) noexcept {
+        const std::scoped_lock lock(admission_mutex);
+        --admitted_items;
+        admitted_queue_bytes -= queue_bytes;
+        admitted_buffer_bytes -= buffer_bytes;
+    }
+
     std::unique_ptr<ReaderRuntime> runtime;
-    std::mutex jobs_mutex;
+    mutable std::mutex jobs_mutex;
     std::unordered_map<std::string, Job> jobs;
+    std::mutex admission_mutex;
+    std::size_t admitted_items{0};
+    std::size_t admitted_queue_bytes{0};
+    std::size_t admitted_buffer_bytes{0};
 };
 
 struct AddonContext;
@@ -163,7 +189,7 @@ using Payload = std::variant<
     WorkspaceVerification>;
 
 struct AsyncWork final {
-    napi_async_work work = nullptr;
+    napi_threadsafe_function completion = nullptr;
     napi_deferred deferred = nullptr;
     std::shared_ptr<RuntimeState> state;
     Operation operation;
@@ -184,6 +210,10 @@ struct AsyncWork final {
     PagePoint end_point{};
     CancellationToken cancellation;
     std::optional<std::string> job_id;
+    RuntimeTaskPriority priority{RuntimeTaskPriority::adjacent_page};
+    std::size_t queue_bytes{base_operation_bytes};
+    std::size_t buffer_bytes{0};
+    bool admitted{false};
     Payload payload;
     std::optional<Error> error;
 };
@@ -713,8 +743,7 @@ void store(Result<void> result, AsyncWork& work) {
     }
 }
 
-void execute(napi_env, void* data) {
-    auto& work = *static_cast<AsyncWork*>(data);
+void execute_application(AsyncWork& work) {
     try {
         auto& app = work.state->runtime->application();
         switch(work.operation) {
@@ -782,6 +811,14 @@ void execute(napi_env, void* data) {
                 break;
             case Operation::verify_workspace: store(app.verify_workspace(), work); break;
         }
+        if(const auto* rendered = std::get_if<EncodedPageImage>(&work.payload);
+           rendered != nullptr && rendered->png.size() > maximum_boundary_buffer_bytes) {
+            work.payload = std::monostate{};
+            work.error = Error(
+                ErrorCode::resource_exhausted,
+                "Rendered page exceeds the cross-boundary Buffer budget"
+            );
+        }
     } catch(const std::exception& exception) {
         work.error = Error(ErrorCode::internal, exception.what());
     } catch(...) {
@@ -840,13 +877,16 @@ napi_value payload_value(napi_env env, const Payload& payload) {
     );
 }
 
-void complete(napi_env env, napi_status status, void* data) {
+void complete(napi_env env, napi_value, void*, void* data) {
     std::unique_ptr<AsyncWork> work(static_cast<AsyncWork*>(data));
     if(work->job_id) {
         work->state->finish_job(*work->job_id);
     }
-    if(status != napi_ok && !work->error) {
-        work->error = Error(ErrorCode::cancelled, "Native operation was cancelled");
+    if(env == nullptr) {
+        if(work->admitted) {
+            work->state->release_admission(work->queue_bytes, work->buffer_bytes);
+        }
+        return;
     }
     if(work->error) {
         napi_value code = nullptr;
@@ -868,7 +908,10 @@ void complete(napi_env env, napi_status status, void* data) {
             napi_reject_deferred(env, work->deferred, error);
         }
     }
-    napi_delete_async_work(env, work->work);
+    if(work->admitted) {
+        work->state->release_admission(work->queue_bytes, work->buffer_bytes);
+        work->admitted = false;
+    }
 }
 
 std::optional<std::string> string_argument(
@@ -1458,35 +1501,115 @@ napi_value schedule(napi_env env, napi_callback_info info) {
             }
             break;
     }
+    switch(work->operation) {
+        case Operation::render_tile:
+            work->priority = RuntimeTaskPriority::visible_tile;
+            work->buffer_bytes = work->tile_request->width_pixels
+                * work->tile_request->height_pixels * 4U;
+            break;
+        case Operation::page_info:
+        case Operation::page_text_layout:
+        case Operation::select_text:
+        case Operation::open_document:
+            work->priority = RuntimeTaskPriority::adjacent_page;
+            break;
+        case Operation::render_page:
+            work->priority = RuntimeTaskPriority::thumbnail;
+            work->buffer_bytes = maximum_boundary_buffer_bytes;
+            break;
+        case Operation::extract_page_text:
+        case Operation::rebuild_search_index:
+            work->priority = RuntimeTaskPriority::indexing;
+            break;
+        case Operation::read_asset:
+            work->buffer_bytes = 10U * 1024U * 1024U;
+            break;
+        default:
+            work->priority = RuntimeTaskPriority::adjacent_page;
+            break;
+    }
+    if(work->job_id && work->state->has_job(*work->job_id)) {
+        napi_throw_error(env, "CONFLICT", "Job ID is already active");
+        return nullptr;
+    }
+    if(!work->state->try_admit(work->queue_bytes, work->buffer_bytes)) {
+        napi_throw_error(
+            env,
+            "RESOURCE_EXHAUSTED",
+            "Reader operation admission budget is exhausted"
+        );
+        return nullptr;
+    }
+    work->admitted = true;
+
     CancellationSource cancellation_source;
     work->cancellation = cancellation_source.token();
     napi_value promise = nullptr;
     napi_value resource_name = nullptr;
     if(napi_create_promise(env, &work->deferred, &promise) != napi_ok
        || napi_create_string_utf8(env, "context_reader.operation", NAPI_AUTO_LENGTH, &resource_name) != napi_ok
-       || napi_create_async_work(
-           env, nullptr, resource_name, execute, complete, work.get(), &work->work
+       || napi_create_threadsafe_function(
+           env,
+           nullptr,
+           nullptr,
+           resource_name,
+           0,
+           1,
+           nullptr,
+           nullptr,
+           nullptr,
+           complete,
+           &work->completion
        ) != napi_ok) {
-        if(work->work != nullptr) {
-            napi_delete_async_work(env, work->work);
-        }
+        work->state->release_admission(work->queue_bytes, work->buffer_bytes);
+        work->admitted = false;
         napi_throw_error(env, "NAPI_ASYNC_FAILED", "Failed to schedule native operation");
         return nullptr;
     }
-    if(work->job_id && !work->state->register_job(
-                           *work->job_id,
-                           cancellation_source,
-                           env,
-                           work->work
-                       )) {
-        napi_delete_async_work(env, work->work);
+    if(work->job_id && !work->state->register_job(*work->job_id, cancellation_source)) {
+        napi_release_threadsafe_function(work->completion, napi_tsfn_abort);
+        work->state->release_admission(work->queue_bytes, work->buffer_bytes);
+        work->admitted = false;
         napi_throw_error(env, "CONFLICT", "Job ID is already active");
         return nullptr;
     }
-    if(napi_queue_async_work(env, work->work) != napi_ok) {
+    auto* scheduled_work = work.get();
+    const auto completion = work->completion;
+    auto submitted = work->state->runtime->executor().submit(
+        [scheduled_work, completion] {
+            execute_application(*scheduled_work);
+            const auto call_status = napi_call_threadsafe_function(
+                completion,
+                scheduled_work,
+                napi_tsfn_blocking
+            );
+            static_cast<void>(napi_release_threadsafe_function(completion, napi_tsfn_release));
+            if(call_status != napi_ok) {
+                if(scheduled_work->job_id) {
+                    scheduled_work->state->finish_job(*scheduled_work->job_id);
+                }
+                if(scheduled_work->admitted) {
+                    scheduled_work->state->release_admission(
+                        scheduled_work->queue_bytes,
+                        scheduled_work->buffer_bytes
+                    );
+                }
+                delete scheduled_work;
+            }
+        },
+        work->priority,
+        work->queue_bytes
+    );
+    if(!submitted) {
         if(work->job_id) work->state->finish_job(*work->job_id);
-        napi_delete_async_work(env, work->work);
-        napi_throw_error(env, "NAPI_ASYNC_FAILED", "Failed to schedule native operation");
+        napi_release_threadsafe_function(work->completion, napi_tsfn_abort);
+        work->state->release_admission(work->queue_bytes, work->buffer_bytes);
+        work->admitted = false;
+        napi_throw_error(
+            env,
+            error_code(submitted.error().code()),
+            submitted.error().message().c_str()
+        );
         return nullptr;
     }
     work.release();

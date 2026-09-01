@@ -37,6 +37,7 @@ app.whenReady().then(() => {
       && message.workspaceConflict === 'CONFLICT'
       && message.documentCount === 1
       && message.duplicateJobCode === 'CONFLICT'
+      && message.admissionCode === 'RESOURCE_EXHAUSTED'
       && message.cancellationAccepted === true
       && message.cancellationCode === 'CANCELLED'
       && message.unknownCancellation === false

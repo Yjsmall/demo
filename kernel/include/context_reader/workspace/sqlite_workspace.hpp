@@ -36,7 +36,8 @@ public:
     );
     [[nodiscard]] static Result<WorkspaceInfo> restore_package(
         const std::filesystem::path& package_path,
-        const std::filesystem::path& empty_target
+        const std::filesystem::path& empty_target,
+        const CancellationToken& cancellation = CancellationToken{}
     );
 
     SqliteWorkspace(const SqliteWorkspace&) = delete;

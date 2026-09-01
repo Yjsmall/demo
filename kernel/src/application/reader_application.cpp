@@ -20,7 +20,7 @@ public:
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
     MuPdfEngine pdf_engine;
     std::unique_ptr<SqliteWorkspace> workspace;
-    std::unique_ptr<DocumentSession> document_session;
+    std::shared_ptr<DocumentSession> document_session;
 #endif
 };
 
@@ -95,13 +95,18 @@ Result<WorkspaceInfo> ReaderApplication::open_workspace(const std::filesystem::p
 }
 
 Result<void> ReaderApplication::close_workspace() {
-    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
-    if(implementation_->workspace == nullptr) {
-        return Result<void>::failure(Error(ErrorCode::not_found, "No workspace is open"));
+    std::shared_ptr<DocumentSession> session;
+    std::unique_ptr<SqliteWorkspace> workspace;
+    {
+        const std::scoped_lock lock(implementation_->mutex);
+        if(implementation_->workspace == nullptr) {
+            return Result<void>::failure(Error(ErrorCode::not_found, "No workspace is open"));
+        }
+        session = std::exchange(implementation_->document_session, nullptr);
+        workspace = std::move(implementation_->workspace);
     }
-    implementation_->document_session.reset();
-    implementation_->workspace.reset();
+    if(session) session->shutdown();
     return Result<void>::success();
 #else
     return Result<void>::failure(
@@ -198,7 +203,9 @@ Result<DocumentRecord> ReaderApplication::open_document(
         );
     }
     auto record = std::move(resolved).value().document;
-    implementation_->document_session = std::move(session).value();
+    implementation_->document_session = std::shared_ptr<DocumentSession>(
+        std::move(session).value()
+    );
     return Result<DocumentRecord>::success(std::move(record));
 #else
     static_cast<void>(document_id);
@@ -209,12 +216,16 @@ Result<DocumentRecord> ReaderApplication::open_document(
 }
 
 Result<void> ReaderApplication::close_document() {
-    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
-    if(implementation_->document_session == nullptr) {
-        return Result<void>::failure(Error(ErrorCode::not_found, "No document is open"));
+    std::shared_ptr<DocumentSession> session;
+    {
+        const std::scoped_lock lock(implementation_->mutex);
+        if(implementation_->document_session == nullptr) {
+            return Result<void>::failure(Error(ErrorCode::not_found, "No document is open"));
+        }
+        session = std::exchange(implementation_->document_session, nullptr);
     }
-    implementation_->document_session.reset();
+    session->shutdown();
     return Result<void>::success();
 #else
     return Result<void>::failure(
@@ -224,12 +235,14 @@ Result<void> ReaderApplication::close_document() {
 }
 
 Result<PageInfo> ReaderApplication::page_info(std::size_t page_index) {
-    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
-    if(implementation_->document_session == nullptr) {
-        return Result<PageInfo>::failure(Error(ErrorCode::not_found, "No document is open"));
+    std::shared_ptr<DocumentSession> session;
+    {
+        const std::scoped_lock lock(implementation_->mutex);
+        session = implementation_->document_session;
     }
-    return implementation_->document_session->page_info(page_index);
+    if(!session) return Result<PageInfo>::failure(Error(ErrorCode::not_found, "No document is open"));
+    return session->page_info(page_index);
 #else
     static_cast<void>(page_index);
     return Result<PageInfo>::failure(
@@ -243,19 +256,23 @@ Result<EncodedPageImage> ReaderApplication::render_page(
     double pixels_per_point,
     const CancellationToken& cancellation
 ) {
-    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
     if(cancellation.is_cancellation_requested()) {
         return Result<EncodedPageImage>::failure(
             Error(ErrorCode::cancelled, "Page render was cancelled")
         );
     }
-    if(implementation_->document_session == nullptr) {
+    std::shared_ptr<DocumentSession> session;
+    {
+        const std::scoped_lock lock(implementation_->mutex);
+        session = implementation_->document_session;
+    }
+    if(!session) {
         return Result<EncodedPageImage>::failure(
             Error(ErrorCode::not_found, "No document is open")
         );
     }
-    auto rendered = implementation_->document_session->render_page_png(page_index, pixels_per_point);
+    auto rendered = session->render_page_png(page_index, pixels_per_point);
     if(cancellation.is_cancellation_requested()) {
         return Result<EncodedPageImage>::failure(
             Error(ErrorCode::cancelled, "Page render was cancelled")
@@ -272,12 +289,14 @@ Result<EncodedPageImage> ReaderApplication::render_page(
 }
 
 Result<PageText> ReaderApplication::extract_page_text(std::size_t page_index) {
-    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
-    if(implementation_->document_session == nullptr) {
-        return Result<PageText>::failure(Error(ErrorCode::not_found, "No document is open"));
+    std::shared_ptr<DocumentSession> session;
+    {
+        const std::scoped_lock lock(implementation_->mutex);
+        session = implementation_->document_session;
     }
-    return implementation_->document_session->extract_text(page_index);
+    if(!session) return Result<PageText>::failure(Error(ErrorCode::not_found, "No document is open"));
+    return session->extract_text(page_index);
 #else
     static_cast<void>(page_index);
     return Result<PageText>::failure(
@@ -290,15 +309,19 @@ Result<RenderedTile> ReaderApplication::render_tile(
     const TileRequest& request,
     const CancellationToken& cancellation
 ) {
-    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
     if(cancellation.is_cancellation_requested()) {
         return Result<RenderedTile>::failure(Error(ErrorCode::cancelled, "Tile render was cancelled"));
     }
-    if(implementation_->document_session == nullptr) {
+    std::shared_ptr<DocumentSession> session;
+    {
+        const std::scoped_lock lock(implementation_->mutex);
+        session = implementation_->document_session;
+    }
+    if(!session) {
         return Result<RenderedTile>::failure(Error(ErrorCode::not_found, "No document is open"));
     }
-    auto rendered = implementation_->document_session->render_tile(request);
+    auto rendered = session->render_tile(request);
     if(cancellation.is_cancellation_requested()) {
         return Result<RenderedTile>::failure(Error(ErrorCode::cancelled, "Tile render was cancelled"));
     }
@@ -312,12 +335,14 @@ Result<RenderedTile> ReaderApplication::render_tile(
 }
 
 Result<PageTextLayout> ReaderApplication::page_text_layout(std::size_t page_index) {
-    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
-    if(implementation_->document_session == nullptr) {
-        return Result<PageTextLayout>::failure(Error(ErrorCode::not_found, "No document is open"));
+    std::shared_ptr<DocumentSession> session;
+    {
+        const std::scoped_lock lock(implementation_->mutex);
+        session = implementation_->document_session;
     }
-    return implementation_->document_session->page_text_layout(page_index);
+    if(!session) return Result<PageTextLayout>::failure(Error(ErrorCode::not_found, "No document is open"));
+    return session->page_text_layout(page_index);
 #else
     static_cast<void>(page_index);
     return Result<PageTextLayout>::failure(
@@ -331,12 +356,14 @@ Result<TextSelection> ReaderApplication::select_text(
     PagePoint start_point,
     PagePoint end_point
 ) {
-    const std::scoped_lock lock(implementation_->mutex);
 #if defined(CONTEXT_READER_HAS_MUPDF) && defined(CONTEXT_READER_HAS_WORKSPACE)
-    if(implementation_->document_session == nullptr) {
-        return Result<TextSelection>::failure(Error(ErrorCode::not_found, "No document is open"));
+    std::shared_ptr<DocumentSession> session;
+    {
+        const std::scoped_lock lock(implementation_->mutex);
+        session = implementation_->document_session;
     }
-    return implementation_->document_session->select_text(page_index, start_point, end_point);
+    if(!session) return Result<TextSelection>::failure(Error(ErrorCode::not_found, "No document is open"));
+    return session->select_text(page_index, start_point, end_point);
 #else
     static_cast<void>(page_index);
     static_cast<void>(start_point);
@@ -538,11 +565,8 @@ Result<WorkspaceInfo> ReaderApplication::restore_workspace(
     if(cancellation.is_cancellation_requested()) {
         return Result<WorkspaceInfo>::failure(Error(ErrorCode::cancelled, "Workspace restore was cancelled"));
     }
-    auto restored = SqliteWorkspace::restore_package(package_path, empty_target);
+    auto restored = SqliteWorkspace::restore_package(package_path, empty_target, cancellation);
     if(!restored) return restored;
-    if(cancellation.is_cancellation_requested()) {
-        return Result<WorkspaceInfo>::failure(Error(ErrorCode::cancelled, "Workspace restore was cancelled"));
-    }
     auto opened = SqliteWorkspace::open(empty_target, implementation_->pdf_engine);
     if(!opened) return Result<WorkspaceInfo>::failure(opened.error());
     implementation_->workspace = std::move(opened).value();

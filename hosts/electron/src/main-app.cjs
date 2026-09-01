@@ -74,6 +74,7 @@ function resetReady() {
     resolveReady = resolve;
     rejectReady = reject;
   });
+  ready.catch(() => {});
 }
 
 function rejectPending(error, generation) {
@@ -117,13 +118,12 @@ function startUtility() {
   child = utility;
   utility.stdout?.pipe(process.stdout);
   utility.stderr?.pipe(process.stderr);
-  connectDataPort(utility);
-
   utility.on('message', (message) => {
     if (utility !== child || generation !== utilityGeneration) return;
     if (message?.kind === 'ready') {
       restoreUtilityState(utility, generation).then(
         () => {
+          connectDataPort(utility);
           resolveReady({ ...message.runtimeInfo, utilityGeneration: generation });
         },
         (error) => {
@@ -137,7 +137,9 @@ function startUtility() {
     if (message?.kind === 'startup-error') {
       const error = new Error(message.error?.message || 'Reader utility failed to start');
       error.code = message.error?.code || 'INTERNAL';
+      utilityRestartAllowed = false;
       rejectReady(error);
+      utility.kill();
       return;
     }
     if (message?.kind !== 'response') {
@@ -161,6 +163,9 @@ function startUtility() {
     if (utility !== child || generation !== utilityGeneration) return;
     const error = new Error(`Reader utility exited with code ${code}`);
     error.code = 'UTILITY_EXITED';
+    if (window && !window.isDestroyed()) {
+      window.webContents.send('reader:data-port-closed', { generation });
+    }
     rejectReady(error);
     rejectPending(error, generation);
     child = null;
@@ -231,6 +236,19 @@ async function runUtilityRestartSmoke() {
 
     const previousGeneration = utilityGeneration;
     utilityRestartAllowed = true;
+    await window.webContents.executeJavaScript(`
+      (() => {
+        const job = window.contextReader.renderTile({
+          pageIndex: 0, pixelsPerPoint: 1, xPixels: 0, yPixels: 0,
+          widthPixels: 128, heightPixels: 128, generation: 901, testDelayMs: 30000,
+        });
+        globalThis.__contextReaderRestartTile = job.result.then(
+          (tile) => ({ ok: true, byteLength: tile.rgba.byteLength }),
+          (error) => ({ ok: false, code: error?.code || null }),
+        );
+        return true;
+      })()
+    `);
     const interrupted = requestUtility('__testDelay', [30_000]);
     await new Promise((resolve) => setImmediate(resolve));
     child.kill();
@@ -241,10 +259,34 @@ async function runUtilityRestartSmoke() {
       interruptedCode = error?.code;
     }
     const runtime = await waitForUtilityRestart(previousGeneration);
+    const interruptedTile = await window.webContents.executeJavaScript(
+      'globalThis.__contextReaderRestartTile',
+    );
+    let freshTile = null;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      freshTile = await window.webContents.executeJavaScript(`
+        (async () => {
+          const job = window.contextReader.renderTile({
+            pageIndex: 0, pixelsPerPoint: 1, xPixels: 0, yPixels: 0,
+            widthPixels: 128, heightPixels: 128, generation: 902,
+          });
+          try {
+            const tile = await job.result;
+            return { ok: true, byteLength: tile.rgba.byteLength };
+          } catch (error) {
+            return { ok: false, code: error?.code || null };
+          }
+        })()
+      `);
+      if (freshTile.ok || freshTile.code !== 'UTILITY_UNAVAILABLE') break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     const documents = await requestUtility('listDocuments', []);
     const page = await requestUtility('pageInfo', [0]);
     const rendered = await requestUtility('renderPage', [0, 1], 'restart-fresh-render');
-    if (interruptedCode !== 'UTILITY_EXITED' || runtime.utilityGeneration <= previousGeneration
+    if (interruptedCode !== 'UTILITY_EXITED' || interruptedTile?.code !== 'UTILITY_EXITED'
+        || freshTile?.ok !== true || freshTile.byteLength !== 128 * 128 * 4
+        || runtime.utilityGeneration <= previousGeneration
         || documents.length !== 1 || page.rotation !== 90 || !(rendered.png instanceof Uint8Array)
         || rendered.png.length <= 8) {
       throw new Error('Utility restart did not restore state or isolate the stale request');
@@ -348,21 +390,31 @@ async function runUtilityRestartSmoke() {
 
 function registerIpc() {
   ipcMain.handle('reader:request', async (event, request) => {
-    if (event.sender !== window?.webContents || !allowedOperations.has(request?.operation)
-        || !Array.isArray(request?.arguments)) {
-      const error = new Error('Reader IPC request is invalid');
-      error.code = 'INVALID_ARGUMENT';
-      throw error;
-    }
-    if (['createWorkspace', 'openWorkspace', 'importDocument', 'inspectBackup'].includes(request.operation)) {
-      const requestedPath = request.arguments[0];
-      if (typeof requestedPath !== 'string' || !grantedPaths.has(path.resolve(requestedPath))) {
-        const error = new Error('Reader path has not been authorized by the host');
+    try {
+      if (event.sender !== window?.webContents || !allowedOperations.has(request?.operation)
+          || !Array.isArray(request?.arguments)) {
+        const error = new Error('Reader IPC request is invalid');
         error.code = 'INVALID_ARGUMENT';
         throw error;
       }
+      if (['createWorkspace', 'openWorkspace', 'importDocument', 'inspectBackup'].includes(request.operation)) {
+        const requestedPath = request.arguments[0];
+        if (typeof requestedPath !== 'string' || !grantedPaths.has(path.resolve(requestedPath))) {
+          const error = new Error('Reader path has not been authorized by the host');
+          error.code = 'INVALID_ARGUMENT';
+          throw error;
+        }
+      }
+      return { ok: true, value: await requestUtility(request.operation, request.arguments) };
+    } catch (error) {
+      return {
+        ok: false,
+        error: {
+          code: typeof error?.code === 'string' ? error.code : 'INTERNAL',
+          message: error instanceof Error ? error.message : String(error),
+        },
+      };
     }
-    return requestUtility(request.operation, request.arguments);
   });
 
   ipcMain.handle('reader:start-job', async (event, request) => {
@@ -529,7 +581,9 @@ function registerIpc() {
           throw new Error(`Unexpected renderer setup content: ${JSON.stringify(result)}`);
         }
       } else if (smokePhase === 'setup' && result.stage === 'closed') {
-        if (result.closed !== true || desiredWorkspacePath !== null || desiredDocumentId !== null) {
+        if (result.closed !== true || result.switchFailureCode !== 'ALREADY_EXISTS'
+            || result.switchStateCleared !== true
+            || desiredWorkspacePath !== null || desiredDocumentId !== null) {
           throw new Error(`Renderer setup did not close cleanly: ${JSON.stringify(result)}`);
         }
         setImmediate(() => app.exit(0));

@@ -1,6 +1,10 @@
 #include <atomic>
+#include <chrono>
+#include <future>
+#include <mutex>
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -27,6 +31,60 @@ TEST_CASE("reader runtime reports its API and executes work") {
     REQUIRE(completion_result.has_value());
     std::move(completion_result).value().get();
     CHECK(task_ran.load());
+}
+
+TEST_CASE("runtime executor bounds queued bytes and prioritizes visible work") {
+    RuntimeExecutorLimits limits{
+        .maximum_queue_items = 3,
+        .maximum_queue_bytes = 8,
+        .priority_aging_interval = std::chrono::seconds(2),
+    };
+    auto executor_result = RuntimeExecutor::create(1, limits);
+    REQUIRE(executor_result.has_value());
+    auto executor = std::move(executor_result).value();
+
+    std::promise<void> blocker_started;
+    std::promise<void> release_blocker;
+    auto release = release_blocker.get_future().share();
+    auto blocker = executor->submit([&blocker_started, release] {
+        blocker_started.set_value();
+        release.wait();
+    });
+    REQUIRE(blocker.has_value());
+    blocker_started.get_future().wait();
+
+    std::mutex order_mutex;
+    std::vector<int> order;
+    auto indexing = executor->submit(
+        [&] {
+            const std::scoped_lock lock(order_mutex);
+            order.push_back(2);
+        },
+        RuntimeTaskPriority::indexing,
+        4
+    );
+    auto visible = executor->submit(
+        [&] {
+            const std::scoped_lock lock(order_mutex);
+            order.push_back(1);
+        },
+        RuntimeTaskPriority::visible_tile,
+        4
+    );
+    REQUIRE(indexing.has_value());
+    REQUIRE(visible.has_value());
+
+    const auto exhausted = executor->submit([] {}, RuntimeTaskPriority::visible_tile, 1);
+    REQUIRE_FALSE(exhausted.has_value());
+    CHECK(exhausted.error().code() == ErrorCode::resource_exhausted);
+
+    release_blocker.set_value();
+    std::move(blocker).value().get();
+    std::move(indexing).value().get();
+    std::move(visible).value().get();
+    REQUIRE(order.size() == 2);
+    CHECK(order[0] == 1);
+    CHECK(order[1] == 2);
 }
 
 TEST_CASE("stable IDs parse and compare by value") {

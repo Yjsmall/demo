@@ -51,7 +51,8 @@ function setStatus(message, isError = false) {
 
 function errorMessage(error) {
   const code = typeof error?.code === 'string' ? `${error.code}: ` : '';
-  return `${code}${error instanceof Error ? error.message : String(error)}`;
+  const message = typeof error?.message === 'string' ? error.message : String(error);
+  return `${code}${message}`;
 }
 
 async function perform(label, operation) {
@@ -351,21 +352,43 @@ async function refreshDocuments() {
   renderDocuments();
 }
 
+function resetWorkspaceUiState() {
+  state.documents = [];
+  state.pageInfos = [];
+  state.annotations = [];
+  state.notes = [];
+  state.selectedAnnotationId = null;
+  state.pendingSelection = null;
+  state.noteDirty = false;
+  renderDocuments();
+  renderNote();
+  updatePageIndicator();
+}
+
+async function closeCurrentWorkspace() {
+  clearPageViews();
+  if (state.document) {
+    await api.closeDocument();
+    state.document = null;
+  }
+  if (state.workspace) {
+    await api.closeWorkspace();
+    state.workspace = null;
+  }
+  resetWorkspaceUiState();
+}
+
 async function openWorkspaceAt(workspacePath, create) {
   await flushPendingNote();
   await perform(create ? '正在创建工作区' : '正在打开工作区', async () => {
-    if (state.workspace) {
-      if (state.document) await api.closeDocument();
-      await api.closeWorkspace();
+    if (state.workspace || state.document) await closeCurrentWorkspace();
+    else {
+      clearPageViews();
+      resetWorkspaceUiState();
     }
-    clearPageViews();
     state.workspace = create
       ? await api.createWorkspace(workspacePath)
       : await api.openWorkspace(workspacePath);
-    state.document = null;
-    state.annotations = [];
-    state.notes = [];
-    state.noteDirty = false;
     await refreshDocuments();
   });
   updateControls();
@@ -407,13 +430,12 @@ async function restoreWorkspace() {
   if (!target) return;
   await flushPendingNote();
   await perform('正在恢复工作区', async () => {
-    if (state.document) await api.closeDocument();
-    if (state.workspace) await api.closeWorkspace();
-    clearPageViews();
-    state.document = null;
+    if (state.workspace || state.document) await closeCurrentWorkspace();
+    else {
+      clearPageViews();
+      resetWorkspaceUiState();
+    }
     state.workspace = await awaitJob(api.restoreWorkspace(packagePath, target));
-    state.annotations = [];
-    state.notes = [];
     await refreshDocuments();
   });
 }
@@ -481,6 +503,8 @@ function clearPageViews() {
   bumpGeneration(true);
   state.pageViews.clear();
   elements['pages-container'].replaceChildren();
+  elements['pages-container'].hidden = true;
+  elements['empty-state'].hidden = false;
 }
 
 function initializePageViews() {
@@ -689,6 +713,7 @@ async function changePage(delta) {
   state.pageViews.get(target)?.stage.scrollIntoView({ block: 'start' });
   updatePageIndicator();
   updateControls();
+  renderNote();
 }
 
 async function changeZoom(delta) {
@@ -891,12 +916,17 @@ async function runSmoke() {
         uiContract: inspectUiContract(),
         tileContract: inspectTilePixels(),
       });
-      await api.closeDocument();
-      state.document = null;
-      await api.closeWorkspace();
-      state.workspace = null;
+      let switchFailureCode = null;
+      try {
+        await openWorkspaceAt(config.workspacePath, true);
+      } catch (error) {
+        switchFailureCode = error?.code || null;
+      }
+      const switchStateCleared = state.workspace === null && state.document === null
+        && state.documents.length === 0 && state.pageViews.size === 0;
       await api.reportSmokeResult({
         status: 'ok', phase: config.phase, stage: 'closed', closed: true,
+        switchFailureCode, switchStateCleared,
       });
       return;
     }

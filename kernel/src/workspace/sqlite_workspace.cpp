@@ -38,6 +38,11 @@ namespace context_reader {
 namespace {
 
 constexpr std::uint32_t current_schema_version = 4;
+constexpr std::uint64_t maximum_package_manifest_bytes = 1024U * 1024U;
+constexpr std::uint64_t maximum_package_entry_bytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t maximum_package_total_bytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr std::size_t maximum_package_entries = 4'096;
+constexpr std::uint64_t package_disk_reserve_bytes = 256U * 1024U * 1024U;
 
 class WorkspaceLock final {
 public:
@@ -257,7 +262,7 @@ private:
     while(input) {
         if(cancellation.is_cancellation_requested()) {
             return Result<std::string>::failure(
-                Error(ErrorCode::cancelled, "Document import was cancelled")
+                Error(ErrorCode::cancelled, "File hashing was cancelled")
             );
         }
         input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
@@ -873,6 +878,12 @@ struct ParsedPackageManifest final {
         || value.starts_with("objects/assets/");
 }
 
+[[nodiscard]] bool sha256_text_is_valid(std::string_view value) {
+    return value.size() == 64U && std::all_of(value.begin(), value.end(), [](char digit) {
+        return (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f');
+    });
+}
+
 [[nodiscard]] Result<ParsedPackageManifest> parse_package_manifest(std::string_view json) {
     if(json.empty() || json.size() > 1024U * 1024U) {
         return Result<ParsedPackageManifest>::failure(Error(ErrorCode::invalid_argument, "Package manifest size is invalid"));
@@ -914,7 +925,7 @@ struct ParsedPackageManifest final {
         const auto* path = reinterpret_cast<const char*>(sqlite3_column_text(rows.value().get(), 0));
         const auto* sha = reinterpret_cast<const char*>(sqlite3_column_text(rows.value().get(), 1));
         const auto size = sqlite3_column_int64(rows.value().get(), 2);
-        if(path == nullptr || sha == nullptr || size < 0 || std::string_view(sha).size() != 64
+        if(path == nullptr || sha == nullptr || size < 0 || !sha256_text_is_valid(sha)
            || !safe_package_path(path) || !paths.insert(path).second) {
             return Result<ParsedPackageManifest>::failure(Error(ErrorCode::invalid_argument, "Package manifest entry is invalid"));
         }
@@ -924,7 +935,8 @@ struct ParsedPackageManifest final {
             .size = static_cast<std::uint64_t>(size),
         });
     }
-    if(step != SQLITE_DONE || manifest.entries.empty()) {
+    if(step != SQLITE_DONE || manifest.entries.empty() || manifest.entries.size() > maximum_package_entries
+       || !paths.contains("workspace.db")) {
         return Result<ParsedPackageManifest>::failure(Error(ErrorCode::invalid_argument, "Package manifest entries are invalid"));
     }
     return Result<ParsedPackageManifest>::success(std::move(manifest));
@@ -932,7 +944,8 @@ struct ParsedPackageManifest final {
 
 [[nodiscard]] Result<BackupInspection> validate_and_extract_package(
     const std::filesystem::path& package_path,
-    const std::filesystem::path& extraction_root
+    const std::filesystem::path& extraction_root,
+    const CancellationToken& cancellation = CancellationToken{}
 ) {
     if(!std::filesystem::is_regular_file(package_path)) {
         return Result<BackupInspection>::failure(Error(ErrorCode::not_found, "Backup package was not found"));
@@ -952,6 +965,12 @@ struct ParsedPackageManifest final {
     // written with forced ZIP64 even though its reader and external ZIP readers
     // accept the same archive.
     const auto file_count = mz_zip_reader_get_num_files(&archive);
+    if(file_count == 0 || file_count > maximum_package_entries + 1U) {
+        close_archive();
+        return Result<BackupInspection>::failure(
+            Error(ErrorCode::invalid_argument, "Backup contains too many entries")
+        );
+    }
     std::unordered_map<std::string, mz_uint> archive_entries;
     std::uint64_t total_size = 0;
     mz_uint manifest_index = 0;
@@ -967,8 +986,9 @@ struct ParsedPackageManifest final {
         if(name.empty() || stat.m_is_directory || stat.m_is_encrypted || !stat.m_is_supported
            || unix_type == 0120000U || name.find('\\') != std::string::npos
            || !archive_entries.emplace(name, index).second
-           || stat.m_uncomp_size > 100ULL * 1024ULL * 1024ULL * 1024ULL
-           || total_size > 100ULL * 1024ULL * 1024ULL * 1024ULL - stat.m_uncomp_size) {
+           || stat.m_uncomp_size > maximum_package_entry_bytes
+           || total_size > maximum_package_total_bytes - stat.m_uncomp_size
+           || (name == "manifest.json" && stat.m_uncomp_size > maximum_package_manifest_bytes)) {
             close_archive();
             return Result<BackupInspection>::failure(Error(ErrorCode::invalid_argument, "Backup contains an unsafe entry"));
         }
@@ -981,6 +1001,12 @@ struct ParsedPackageManifest final {
     if(!manifest_found) {
         close_archive();
         return Result<BackupInspection>::failure(Error(ErrorCode::invalid_argument, "Backup manifest is missing"));
+    }
+    if(cancellation.is_cancellation_requested()) {
+        close_archive();
+        return Result<BackupInspection>::failure(
+            Error(ErrorCode::cancelled, "Workspace restore was cancelled")
+        );
     }
     size_t manifest_size = 0;
     void* manifest_data = mz_zip_reader_extract_to_heap(&archive, manifest_index, &manifest_size, 0);
@@ -998,12 +1024,29 @@ struct ParsedPackageManifest final {
         );
     }
     std::error_code filesystem_error;
+    const auto space = std::filesystem::space(extraction_root.parent_path(), filesystem_error);
+    const auto required_space = total_size > std::numeric_limits<std::uint64_t>::max()
+            - package_disk_reserve_bytes
+        ? std::numeric_limits<std::uint64_t>::max()
+        : total_size + package_disk_reserve_bytes;
+    if(filesystem_error || space.available < required_space) {
+        close_archive();
+        return Result<BackupInspection>::failure(
+            Error(ErrorCode::resource_exhausted, "Insufficient disk space for backup validation")
+        );
+    }
     std::filesystem::create_directories(extraction_root, filesystem_error);
     if(filesystem_error) {
         close_archive();
         return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Backup validation directory could not be created"));
     }
     for(const auto& entry : manifest.value().entries) {
+        if(cancellation.is_cancellation_requested()) {
+            close_archive();
+            return Result<BackupInspection>::failure(
+                Error(ErrorCode::cancelled, "Workspace restore was cancelled")
+            );
+        }
         const auto found = archive_entries.find(entry.path);
         mz_zip_archive_file_stat stat{};
         if(found == archive_entries.end() || !mz_zip_reader_file_stat(&archive, found->second, &stat)
@@ -1013,16 +1056,57 @@ struct ParsedPackageManifest final {
         }
         const auto destination = extraction_root / std::filesystem::path(entry.path);
         std::filesystem::create_directories(destination.parent_path(), filesystem_error);
-        const auto destination_utf8 = utf8_path(destination);
-        if(filesystem_error || !mz_zip_reader_extract_to_file(&archive, found->second, destination_utf8.c_str(), 0)) {
+        struct ExtractionSink final {
+            std::ofstream output;
+            const CancellationToken& cancellation;
+            bool cancelled{false};
+        } sink{.output = std::ofstream(destination, std::ios::binary | std::ios::trunc),
+               .cancellation = cancellation};
+        const auto write_chunk = [](void* opaque, mz_uint64 offset, const void* data, std::size_t size) -> std::size_t {
+            auto& target = *static_cast<ExtractionSink*>(opaque);
+            if(target.cancellation.is_cancellation_requested()) {
+                target.cancelled = true;
+                return 0;
+            }
+            if(offset > static_cast<mz_uint64>(std::numeric_limits<std::streamoff>::max())) return 0;
+            target.output.seekp(static_cast<std::streamoff>(offset));
+            target.output.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+            return target.output ? size : 0;
+        };
+        const auto extracted = !filesystem_error && sink.output
+            && mz_zip_reader_extract_to_callback(
+                &archive,
+                found->second,
+                write_chunk,
+                &sink,
+                0
+            );
+        sink.output.close();
+        if(sink.cancelled) {
+            close_archive();
+            return Result<BackupInspection>::failure(
+                Error(ErrorCode::cancelled, "Workspace restore was cancelled")
+            );
+        }
+        if(!extracted || !sink.output) {
             close_archive();
             return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Backup entry could not be extracted"));
         }
-        auto hash = sha256_file(destination);
-        if(!hash || hash.value() != entry.sha256) {
+        auto hash = sha256_file(destination, cancellation);
+        if(!hash) {
+            close_archive();
+            return Result<BackupInspection>::failure(hash.error());
+        }
+        if(hash.value() != entry.sha256) {
             close_archive();
             return Result<BackupInspection>::failure(Error(ErrorCode::invalid_argument, "Backup entry hash does not match the manifest"));
         }
+    }
+    if(cancellation.is_cancellation_requested()) {
+        close_archive();
+        return Result<BackupInspection>::failure(
+            Error(ErrorCode::cancelled, "Workspace restore was cancelled")
+        );
     }
     close_archive();
     return Result<BackupInspection>::success(BackupInspection{
@@ -2000,6 +2084,12 @@ public:
         }
 
         std::vector<PackageManifestEntry> entries;
+        if(sources.size() > maximum_package_entries) {
+            cleanup();
+            return Result<BackupInspection>::failure(
+                Error(ErrorCode::resource_exhausted, "Workspace contains too many backup entries")
+            );
+        }
         entries.reserve(sources.size());
         std::uint64_t total_size = 0;
         for(const auto& [archive_path, source_path] : sources) {
@@ -2009,10 +2099,14 @@ public:
             }
             const auto size = std::filesystem::file_size(source_path, filesystem_error);
             auto hash = sha256_file(source_path, cancellation);
-            if(filesystem_error || !hash || size > std::numeric_limits<std::uint64_t>::max() - total_size) {
+            if(filesystem_error || !hash || size > maximum_package_entry_bytes
+               || total_size > maximum_package_total_bytes - size) {
                 cleanup();
                 return Result<BackupInspection>::failure(
-                    hash ? Error(ErrorCode::storage_failure, "Workspace object metadata could not be read") : hash.error()
+                    hash && !filesystem_error
+                        ? Error(ErrorCode::resource_exhausted, "Workspace backup exceeds package limits")
+                        : hash ? Error(ErrorCode::storage_failure, "Workspace object metadata could not be read")
+                               : hash.error()
                 );
             }
             total_size += static_cast<std::uint64_t>(size);
@@ -2033,9 +2127,17 @@ public:
         }
         manifest << "]}";
         manifest.close();
-        if(!manifest) {
+        const auto manifest_size = std::filesystem::file_size(manifest_path, filesystem_error);
+        if(!manifest || filesystem_error || manifest_size > maximum_package_manifest_bytes) {
             cleanup();
-            return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Backup manifest could not be written"));
+            return Result<BackupInspection>::failure(
+                Error(
+                    manifest && !filesystem_error ? ErrorCode::resource_exhausted
+                                                  : ErrorCode::storage_failure,
+                    manifest && !filesystem_error ? "Backup manifest exceeds the package limit"
+                                                  : "Backup manifest could not be written"
+                )
+            );
         }
 
         auto partial = destination;
@@ -2068,6 +2170,12 @@ public:
         if(!written || !ended) {
             std::filesystem::remove(partial, filesystem_error);
             return Result<BackupInspection>::failure(Error(ErrorCode::storage_failure, "Backup archive could not be finalized"));
+        }
+        if(cancellation.is_cancellation_requested()) {
+            std::filesystem::remove(partial, filesystem_error);
+            return Result<BackupInspection>::failure(
+                Error(ErrorCode::cancelled, "Workspace export was cancelled")
+            );
         }
         std::filesystem::rename(partial, destination, filesystem_error);
         if(filesystem_error) {
@@ -2858,10 +2966,16 @@ Result<BackupInspection> SqliteWorkspace::inspect_package(
 
 Result<WorkspaceInfo> SqliteWorkspace::restore_package(
     const std::filesystem::path& package_path,
-    const std::filesystem::path& empty_target
+    const std::filesystem::path& empty_target,
+    const CancellationToken& cancellation
 ) {
     if(empty_target.empty()) {
         return Result<WorkspaceInfo>::failure(Error(ErrorCode::invalid_argument, "Restore target is empty"));
+    }
+    if(cancellation.is_cancellation_requested()) {
+        return Result<WorkspaceInfo>::failure(
+            Error(ErrorCode::cancelled, "Workspace restore was cancelled")
+        );
     }
     std::error_code filesystem_error;
     const auto absolute_target = std::filesystem::absolute(empty_target, filesystem_error);
@@ -2883,15 +2997,10 @@ Result<WorkspaceInfo> SqliteWorkspace::restore_package(
     if(std::filesystem::exists(temporary_root, filesystem_error)) {
         return Result<WorkspaceInfo>::failure(Error(ErrorCode::conflict, "Restore staging directory already exists"));
     }
-    auto inspection = validate_and_extract_package(package_path, temporary_root);
+    auto inspection = validate_and_extract_package(package_path, temporary_root, cancellation);
     if(!inspection) {
         std::filesystem::remove_all(temporary_root, filesystem_error);
         return Result<WorkspaceInfo>::failure(inspection.error());
-    }
-    const auto space = std::filesystem::space(absolute_target.parent_path(), filesystem_error);
-    if(filesystem_error || space.available < inspection.value().total_uncompressed_bytes) {
-        std::filesystem::remove_all(temporary_root, filesystem_error);
-        return Result<WorkspaceInfo>::failure(Error(ErrorCode::resource_exhausted, "Insufficient disk space for workspace restore"));
     }
     auto database = open_database(temporary_root / "workspace.db", false);
     if(!database) {
@@ -2903,6 +3012,12 @@ Result<WorkspaceInfo> SqliteWorkspace::restore_package(
     if(!info) {
         std::filesystem::remove_all(temporary_root, filesystem_error);
         return Result<WorkspaceInfo>::failure(info.error());
+    }
+    if(cancellation.is_cancellation_requested()) {
+        std::filesystem::remove_all(temporary_root, filesystem_error);
+        return Result<WorkspaceInfo>::failure(
+            Error(ErrorCode::cancelled, "Workspace restore was cancelled")
+        );
     }
     if(std::filesystem::exists(absolute_target, filesystem_error)) {
         std::filesystem::remove(absolute_target, filesystem_error);

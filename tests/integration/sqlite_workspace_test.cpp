@@ -5,9 +5,11 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <string>
 #include <string_view>
 
 #include <windows.h>
+#include <miniz.h>
 
 #include "context_reader/pdf/mupdf_engine.hpp"
 #include "context_reader/runtime/reader_runtime.hpp"
@@ -253,6 +255,49 @@ int main() {
     check(exported_package && exported_package.value().valid, "readerpkg export is valid");
     const auto inspected_package = SqliteWorkspace::inspect_package(package_path);
     check(inspected_package && inspected_package.value().valid, "readerpkg validates offline");
+    const auto oversized_manifest_package = test_output_root / "oversized-manifest.readerpkg";
+    {
+        std::string oversized_manifest(1024U * 1024U + 1U, 'x');
+        mz_zip_archive archive{};
+        const auto archive_path = oversized_manifest_package.string();
+        bool written = mz_zip_writer_init_file_v2(
+            &archive,
+            archive_path.c_str(),
+            0,
+            MZ_ZIP_FLAG_WRITE_ZIP64
+        ) != 0;
+        written = written && mz_zip_writer_add_mem(
+            &archive,
+            "manifest.json",
+            oversized_manifest.data(),
+            oversized_manifest.size(),
+            MZ_BEST_COMPRESSION
+        ) != 0;
+        written = written && mz_zip_writer_finalize_archive(&archive) != 0;
+        written = mz_zip_writer_end(&archive) != 0 && written;
+        check(written, "oversized manifest package fixture is created");
+    }
+    const auto oversized_manifest = SqliteWorkspace::inspect_package(
+        oversized_manifest_package
+    );
+    check(
+        !oversized_manifest && oversized_manifest.error().code() == ErrorCode::invalid_argument,
+        "oversized package manifest is rejected before extraction"
+    );
+    CancellationSource cancelled_restore;
+    cancelled_restore.request_cancellation();
+    const auto cancelled_restore_root = test_output_root / "cancelled-restored-workspace";
+    const auto cancelled_restore_result = SqliteWorkspace::restore_package(
+        package_path,
+        cancelled_restore_root,
+        cancelled_restore.token()
+    );
+    check(
+        !cancelled_restore_result
+            && cancelled_restore_result.error().code() == ErrorCode::cancelled
+            && !std::filesystem::exists(cancelled_restore_root),
+        "cancelled readerpkg restore leaves no committed target"
+    );
     const auto restored_root = test_output_root / "restored-workspace";
     const auto restored_info = SqliteWorkspace::restore_package(package_path, restored_root);
     check(

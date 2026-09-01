@@ -1,29 +1,70 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+const readerError = (code, message) => Object.freeze({ code, message });
+
 const invoke = (operation, ...args) => ipcRenderer.invoke('reader:request', {
   operation,
   arguments: args,
+}).then((response) => {
+  if (response?.ok) return response.value;
+  throw readerError(
+    response?.error?.code || 'INTERNAL',
+    response?.error?.message || 'Reader operation failed',
+  );
 });
 
 let dataPort = null;
+let dataPortGeneration = 0;
 const tileJobs = new Map();
-ipcRenderer.on('reader:data-port', (event) => {
+
+function rejectTileJobs(generation, code, message) {
+  for (const [jobId, job] of tileJobs) {
+    if (generation !== undefined && job.generation !== generation) continue;
+    tileJobs.delete(jobId);
+    job.reject(readerError(code, message));
+  }
+}
+
+ipcRenderer.on('reader:data-port', (event, message) => {
+  const generation = Number(message?.generation ?? 0);
+  if (dataPort) {
+    rejectTileJobs(dataPortGeneration, 'UTILITY_EXITED', 'Reader utility data channel was replaced');
+  }
   dataPort?.close();
-  dataPort = event.ports[0] ?? null;
+  const port = event.ports[0] ?? null;
+  dataPort = port;
+  dataPortGeneration = generation;
   if (!dataPort) return;
-  dataPort.onmessage = ({ data }) => {
+  port.onmessage = ({ data }) => {
+    if (port !== dataPort || generation !== dataPortGeneration) return;
     if (data?.kind !== 'tile-response') return;
     const job = tileJobs.get(data.jobId);
-    if (!job) return;
+    if (!job || job.generation !== generation) return;
     tileJobs.delete(data.jobId);
     if (data.ok) job.resolve(data.value);
     else {
-      const error = new Error(data.error?.message || 'Tile render failed');
-      error.code = data.error?.code || 'INTERNAL';
-      job.reject(error);
+      job.reject(readerError(
+        data.error?.code || 'INTERNAL',
+        data.error?.message || 'Tile render failed',
+      ));
     }
   };
-  dataPort.start();
+  port.onmessageerror = () => {
+    if (port !== dataPort) return;
+    rejectTileJobs(generation, 'UTILITY_EXITED', 'Reader utility data channel failed');
+    port.close();
+    dataPort = null;
+  };
+  port.start();
+});
+
+ipcRenderer.on('reader:data-port-closed', (_event, message) => {
+  const generation = Number(message?.generation ?? 0);
+  rejectTileJobs(generation, 'UTILITY_EXITED', 'Reader utility exited');
+  if (generation === dataPortGeneration) {
+    dataPort?.close();
+    dataPort = null;
+  }
 });
 
 let nextJobId = 1;
@@ -36,9 +77,10 @@ const startJob = (operation, ...args) => {
     arguments: args,
   }).then((response) => {
     if (response?.ok) return response.value;
-    const error = new Error(response?.error?.message || 'Reader Job failed');
-    error.code = response?.error?.code || 'INTERNAL';
-    throw error;
+    throw readerError(
+      response?.error?.code || 'INTERNAL',
+      response?.error?.message || 'Reader Job failed',
+    );
   });
   return Object.freeze({
     id: jobId,
@@ -57,12 +99,12 @@ const startTileJob = (request) => {
     reject = rejectValue;
   });
   if (!dataPort) {
-    const error = new Error('Tile data channel is unavailable');
-    error.code = 'UTILITY_UNAVAILABLE';
-    reject(error);
+    reject(readerError('UTILITY_UNAVAILABLE', 'Tile data channel is unavailable'));
   } else {
-    tileJobs.set(jobId, { resolve, reject });
-    dataPort.postMessage({ kind: 'tile-request', jobId, request });
+    const port = dataPort;
+    const generation = dataPortGeneration;
+    tileJobs.set(jobId, { resolve, reject, port, generation });
+    port.postMessage({ kind: 'tile-request', jobId, request });
   }
   return Object.freeze({
     id: jobId,
@@ -71,11 +113,9 @@ const startTileJob = (request) => {
       const job = tileJobs.get(jobId);
       if (job) {
         tileJobs.delete(jobId);
-        const error = new Error('Tile render was cancelled');
-        error.code = 'CANCELLED';
-        job.reject(error);
+        job.reject(readerError('CANCELLED', 'Tile render was cancelled'));
       }
-      dataPort?.postMessage({ kind: 'cancel-job', jobId });
+      job?.port.postMessage({ kind: 'cancel-job', jobId });
     },
   });
 };

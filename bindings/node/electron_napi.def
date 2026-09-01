@@ -14,6 +14,7 @@ EXPORTS
     napi_create_promise
     napi_create_reference
     napi_create_string_utf8
+    napi_create_threadsafe_function
     napi_create_type_error
     napi_create_uint32
     napi_delete_async_work
@@ -41,6 +42,8 @@ EXPORTS
     napi_open_handle_scope
     napi_queue_async_work
     napi_cancel_async_work
+    napi_call_threadsafe_function
+    napi_release_threadsafe_function
     napi_reject_deferred
     napi_resolve_deferred
     napi_set_element

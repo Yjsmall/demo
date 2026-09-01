@@ -27,6 +27,10 @@ DocumentSession::DocumentSession(std::unique_ptr<PdfDocument> document)
     : document_(std::move(document)), page_count_(document_->page_count()), actor_([this] { run(); }) {}
 
 DocumentSession::~DocumentSession() {
+    shutdown();
+}
+
+void DocumentSession::shutdown() {
     {
         const std::scoped_lock lock(mutex_);
         stopping_ = true;
@@ -35,6 +39,8 @@ DocumentSession::~DocumentSession() {
     if(actor_.joinable()) {
         actor_.join();
     }
+    std::unique_lock lock(mutex_);
+    render_idle_.wait(lock, [this] { return active_renders_ == 0; });
 }
 
 std::size_t DocumentSession::page_count() const noexcept {
@@ -57,6 +63,24 @@ Result<EncodedPageImage> DocumentSession::render_page_png(
 }
 
 Result<RenderedTile> DocumentSession::render_tile(const TileRequest& request, SessionPriority priority) {
+    {
+        const std::scoped_lock lock(mutex_);
+        if(stopping_) {
+            return Result<RenderedTile>::failure(
+                Error(ErrorCode::cancelled, "Document session is closing")
+            );
+        }
+        ++active_renders_;
+    }
+    const auto finish_render = [this](void*) {
+        {
+            const std::scoped_lock lock(mutex_);
+            --active_renders_;
+        }
+        render_idle_.notify_all();
+    };
+    std::unique_ptr<void, decltype(finish_render)> active_guard(this, finish_render);
+
     auto source_result = invoke<std::shared_ptr<PdfTileDisplayList>>(priority, [this, request](PdfDocument& document) {
         return display_list(document, request.page_index);
     });

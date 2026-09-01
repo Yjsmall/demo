@@ -140,5 +140,10 @@ if(TARGET reader-bench)
 endif()
 
 if(TARGET sqlite_workspace_test)
-    context_reader_assert_target_links_only(sqlite_workspace_test reader_core SQLite::SQLite3)
+    context_reader_assert_target_links_only(
+        sqlite_workspace_test
+        reader_core
+        SQLite::SQLite3
+        Miniz::Miniz
+    )
 endif()

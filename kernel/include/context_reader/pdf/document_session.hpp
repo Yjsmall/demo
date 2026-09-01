@@ -37,6 +37,8 @@ public:
     DocumentSession& operator=(DocumentSession&&) = delete;
     ~DocumentSession();
 
+    void shutdown();
+
     [[nodiscard]] std::size_t page_count() const noexcept;
     [[nodiscard]] Result<PageInfo> page_info(std::size_t page_index);
     [[nodiscard]] Result<EncodedPageImage> render_page_png(
@@ -109,6 +111,7 @@ private:
 
     mutable std::mutex mutex_;
     std::condition_variable wake_;
+    std::condition_variable render_idle_;
     std::deque<QueuedTask> queue_;
     std::unique_ptr<PdfDocument> document_;
     std::vector<DisplayListEntry> display_lists_;
@@ -116,6 +119,7 @@ private:
     std::uint64_t display_list_clock_{0};
     std::size_t page_count_{};
     std::thread actor_;
+    std::size_t active_renders_{0};
     bool stopping_{false};
 };
 
